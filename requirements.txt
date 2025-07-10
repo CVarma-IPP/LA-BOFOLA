@@ -1,0 +1,29 @@
+# Core GUI and plotting
+PyQt5>=5.15
+PyQt6>=6.0
+matplotlib>=3.5
+pyqtgraph>=0.12
+
+# Scientific computing
+numpy>=1.21
+scipy>=1.7
+scikit-image>=0.19
+imageio>=2.9
+tifffile>=2021.7
+
+# File dialogs and utilities
+# Note: easygui requires tkinter, which must be installed via your system package manager.
+# On Debian/Ubuntu: sudo apt-get install python3-tk
+easygui>=0.98
+watchdog>=2.1
+
+# Optimization
+xopt>=1.2
+
+# Miscellaneous
+threadpoolctl>=3.0
+
+# For compatibility with matplotlib backends
+PyQt5-sip; platform_system=="Linux"
+
+# If using PyQt5, you do not need PyQt6, and vice versa. Both are listed for compatibility.
