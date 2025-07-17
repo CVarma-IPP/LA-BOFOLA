@@ -48,7 +48,9 @@ class WorkerSignals(QObject):
     new_metrics = pyqtSignal(dict)           
     new_suggestions = pyqtSignal(dict)
     finished = pyqtSignal()
-    param_confirmed = pyqtSignal(dict)  # Signal for parameter confirmation
+    # param_confirmed = pyqtSignal(dict)  # Signal for parameter confirmation
+    param_request   = pyqtSignal(dict)   # request GUI to confirm
+    param_confirmed = pyqtSignal(dict)
 
 class OptimizationWorker(Thread):
     """
@@ -100,7 +102,8 @@ class OptimizationWorker(Thread):
 
             # Wait for parameter confirmation via signal/event
             self.param_event.clear()
-            self.gui.request_param_confirmation(suggestions)
+            # self.gui.request_param_confirmation(suggestions)
+            self.signals.param_request.emit(suggestions)
             while not self.param_event.is_set() and not self.stop_event.is_set():
                 time.sleep(0.05)
             if self.stop_event.is_set():
@@ -153,7 +156,8 @@ class OptimizationWorker(Thread):
         results = []
         for params in inputs_list:
             self.param_event.clear()
-            self.gui.request_param_confirmation(params)
+            # self.gui.request_param_confirmation(params)
+            self.signals.param_request.emit(params)
             while not self.param_event.is_set() and not self.stop_event.is_set():
                 time.sleep(0.05)
             if self.stop_event.is_set():
@@ -176,6 +180,7 @@ class OptimizationWorker(Thread):
         - In E-Spec mode: read score,cost,counts from espectra .txt files.
         - In Profile & ICT mode: fallback to spec from profile_dir and charge from ict_dir.
         Returns a dict when both spec & charge are ready, or None after timeout.
+        Computes stability (coefficient of variation) over last N shots for the current parameter set.
         """
         start = time.time()
         while time.time() - start < timeout:
@@ -226,9 +231,26 @@ class OptimizationWorker(Thread):
                     except Exception as e:
                         print(f"Error reading ICT charge files: {e}")
 
-            # Once we have both metrics, return them
+            # Once we have both metrics, compute stability and return them
             if spec is not None and charge is not None:
-                return {'overall': overall, 'spec': spec, 'charge': charge}
+                # --- Compute stability (coefficient of variation of spec over last N shots for this param set) ---
+                # Use a rolling window per parameter set
+                params = tuple(sorted(self.gui.confirmed_params.items())) if self.gui.confirmed_params else None
+                if not hasattr(self, '_pareto_param_history_worker'):
+                    self._pareto_param_history_worker = {}
+                if params is not None:
+                    entry = self._pareto_param_history_worker.setdefault(params, [])
+                    entry.append((spec, charge))
+                    if len(entry) > N:
+                        entry[:] = entry[-N:]
+                    import numpy as np
+                    arr = np.array(entry)
+                    mean_spec = float(np.mean(arr[:,0]))
+                    # Stability: coefficient of variation (std/mean) of spec
+                    stability = float(np.std(arr[:,0]) / mean_spec) if mean_spec != 0 else 0.0
+                else:
+                    stability = 0.0
+                return {'overall': overall, 'spec': spec, 'charge': charge, 'stability': stability}
 
             time.sleep(0.1)
 
@@ -328,9 +350,8 @@ class LPAControlGUI(QMainWindow):
             # “Use” value (90px wide)
             val = QLineEdit()
             val.setFixedWidth(90)
-            val.editingFinished.connect(
-                lambda _, n=name, w=val: self._confirm_param(n, w)
-            )
+            # Connect editingFinished to highlight field if edited after copy
+            val.editingFinished.connect(lambda n=name, w=val: self._on_use_field_edited(n, w))
             grid.addWidget(val, r, 5, alignment=Qt.AlignLeft)
             self.param_bounds[name]  = (lo, hi)
             self.param_widgets[name] = (sug, val)
@@ -347,34 +368,41 @@ class LPAControlGUI(QMainWindow):
         btn_col = QVBoxLayout()
         btn_col.setSpacing(12)
         self.copy_btn = QPushButton("Copy Suggestions")
+        self.confirm_btn = QPushButton("Confirm Parameters")
+        self.start_btn = QPushButton("Start Optimization")
+        self.pause_btn = QPushButton("Pause")
+        self.restart_btn = QPushButton("Restart")
+        # Determine the minimum width needed for the largest button text
+        btns = [self.copy_btn, self.confirm_btn, self.start_btn, self.pause_btn, self.restart_btn]
+        max_width = max(btn.sizeHint().width() for btn in btns)
+        for btn in btns:
+            btn.setFixedWidth(max_width)
         self.copy_btn.clicked.connect(self.copy_suggestions_to_use)
         btn_col.addWidget(self.copy_btn, alignment=Qt.AlignLeft)
-        self.confirm_btn = QPushButton("Confirm Parameters")
         self.confirm_btn.clicked.connect(self.confirm_parameters)
         self.confirm_btn.setEnabled(False)
         btn_col.addWidget(self.confirm_btn, alignment=Qt.AlignLeft)
-        self.start_btn = QPushButton("Start Optimization")
+        # self.start_btn.clicked.connect(self.start_optimization)
         self.start_btn.clicked.connect(self.start_optimization)
+        self.start_btn.setEnabled(False)   # disabled until dirs are set
         btn_col.addWidget(self.start_btn, alignment=Qt.AlignLeft)
-        self.pause_btn = QPushButton("Pause")
         self.pause_btn.setEnabled(False)
         self.pause_btn.clicked.connect(self.pause_optimization)
         btn_col.addWidget(self.pause_btn, alignment=Qt.AlignLeft)
-        self.restart_btn = QPushButton("Restart")
         self.restart_btn.clicked.connect(self.restart_optimization)
         btn_col.addWidget(self.restart_btn, alignment=Qt.AlignLeft)
         btn_col.addStretch(1)
         main_hbox.addLayout(btn_col)
 
-        # --- Add stretch to push everything left and open space on right ---
-        main_hbox.addStretch(1)
-
-        # --- Activity log on the far right ---
+        # --- Activity log immediately to the right of action buttons ---
         self.activity_log = QTextEdit()
         self.activity_log.setReadOnly(True)
         self.activity_log.setPlaceholderText("Activity Log...")
         self.activity_log.setMinimumWidth(220)
         main_hbox.addWidget(self.activity_log, stretch=1)
+
+        # --- Add stretch to push everything left and open space on right (optional) ---
+        # main_hbox.addStretch(1)  # You can comment this out if not needed
 
         # --- Below: Manual Explore/Exploit slider, shots spin, plots ---
         l.addSpacing(10)
@@ -409,12 +437,34 @@ class LPAControlGUI(QMainWindow):
         sl.addStretch(1)
         l.addLayout(sl)
 
+        # --- Plots: overall, spec, charge in a vertical column, Pareto plot to the right ---
+        plot_hbox = QHBoxLayout()
+        plot_vbox = QVBoxLayout()
         self.plot_overall = pg.PlotWidget(title="Overall Objective")
         self.plot_spec    = pg.PlotWidget(title="Diagnostic Score")
         self.plot_charge  = pg.PlotWidget(title="Charge Metric")
         for p in [self.plot_overall, self.plot_spec, self.plot_charge]:
             p.getPlotItem().showGrid(x=True, y=True, alpha=0.3)
-            l.addWidget(p)
+            plot_vbox.addWidget(p)
+        plot_vbox.addStretch(1)
+        plot_hbox.addLayout(plot_vbox, stretch=2)
+        # Pareto plot immediately to the right of the three main plots
+        from pyqtgraph import PlotWidget, ColorBarItem
+        self.pareto_plot = PlotWidget(title="Pareto Front: Spec vs Charge (color=Stability)")
+        self.pareto_plot.setLabel('bottom', 'Spectra Score')
+        self.pareto_plot.setLabel('left', 'Charge')
+        self.pareto_scatter = self.pareto_plot.plot([], [], pen=None, symbol='o', symbolBrush=None)
+        self.pareto_colorbar = None  # Placeholder for colorbar
+        plot_hbox.addWidget(self.pareto_plot, stretch=1)
+        l.addLayout(plot_hbox)
+
+        # --- Interactivity: click on Pareto plot to show parameter settings ---
+        self.pareto_plot.scene().sigMouseClicked.connect(self._on_pareto_click)
+
+        # --- Reset Plots/Analysis button ---
+        self.reset_btn = QPushButton("Reset Plots/Analysis")
+        self.reset_btn.clicked.connect(self.reset_plots_and_analysis)
+        l.addWidget(self.reset_btn, alignment=Qt.AlignRight)
 
         pen = pg.mkPen('#00796b', width=2)
         brush = '#009688'
@@ -424,16 +474,20 @@ class LPAControlGUI(QMainWindow):
             'charge':  self.plot_charge.plot(pen=pen, symbol='o', symbolBrush=brush),
         }
 
+        # Data for Pareto plot
+        self.pareto_data = []  # List of dicts: {'spec':..., 'charge':..., 'stability':..., 'params':...}
+
         # Restore settings from QSettings
         self.restore_settings()
 
     def resizeEvent(self, ev):
-            """Keep slider at half the window width whenever the window is resized."""
-            super().resizeEvent(ev)
-            # only adjust if the slider exists
-            if hasattr(self, 'explore_slider'):
-                self.explore_slider.setFixedWidth(self.width() // 2)
 
+        """Keep slider at half the window width on resize."""
+        super().resizeEvent(ev)
+        # only adjust if the slider exists
+        if hasattr(self, 'explore_slider'):
+            self.explore_slider.setFixedWidth(self.width() // 2)
+            
     def log_activity(self, message):
         """Append a timestamped message to the activity log."""
         from datetime import datetime
@@ -441,10 +495,19 @@ class LPAControlGUI(QMainWindow):
         self.activity_log.append(f"[{ts}] {message}")
 
     def copy_suggestions_to_use(self):
-        """Copy the suggested values into the 'Use' input boxes."""
+        """Copy the suggested values into the 'Use' input boxes and reset highlight."""
         for name, (sug, use) in self.param_widgets.items():
             use.setText(sug.text())
+            use.setStyleSheet("background: white;")  # Reset background
+        self._use_fields_edited = set()  # Track which fields have been edited
         self.log_activity("Copied suggested parameters to 'Use' boxes.")
+
+    def _on_use_field_edited(self, name, widget):
+        """Highlight the 'Use' field if edited after copying suggestions."""
+        widget.setStyleSheet("background: #fff59d;")  # Light yellow
+        if not hasattr(self, '_use_fields_edited'):
+            self._use_fields_edited = set()
+        self._use_fields_edited.add(name)
 
     def _confirm_param(self, name, widget):
         """Store the float you typed when you press Enter in the 'Use:' box.""" 
@@ -463,9 +526,19 @@ class LPAControlGUI(QMainWindow):
             self, f"Select {key} directory"
         )
         if path:
+            self._update_start_button_state()
             setattr(self, f"{key}_dir", path)
             self.log_activity(f"Set {key} directory: {path}")
             QMessageBox.information(self, "Path Set", f"{key} dir: {path}")
+
+    def _update_start_button_state(self):
+            """Enable Start only if the needed dirs are set."""
+            mode = self.get_mode()
+            if mode == 'E-Spec':
+                ready = hasattr(self, 'espec_dir')
+            else:
+                ready = hasattr(self, 'profile_dir') and hasattr(self, 'ict_dir')
+            self.start_btn.setEnabled(ready)
 
     def start_optimization(self):
         """Kick off the background OptimizationWorker thread."""
@@ -473,7 +546,9 @@ class LPAControlGUI(QMainWindow):
         worker = OptimizationWorker(self, self.stop_event)
         worker.signals.new_metrics.connect(self.record_and_plot)
         worker.signals.new_suggestions.connect(self.update_suggestions)
+        worker.signals.param_request.connect(self.request_param_confirmation)
         worker.start()
+        self.signals = worker.signals  # keep for confirm
         self.worker = worker
         self.is_running = True
         self.start_btn.setEnabled(False)
@@ -581,6 +656,7 @@ class LPAControlGUI(QMainWindow):
          - Increment shot counter
          - Append each metric to history
          - Re-draw the curves with the updated data
+         - Update Pareto data and plot
         """
         self.shot_number += 1
         for key in ['overall', 'spec', 'charge']:
@@ -592,6 +668,40 @@ class LPAControlGUI(QMainWindow):
                     self.curves[key].setData(xs, ys)
                 else:
                     self.curves[key].setData([], [])
+
+        # --- Pareto data pipeline ---
+        # Track repeated measurements for each parameter set
+        if not hasattr(self, '_pareto_param_history'):
+            self._pareto_param_history = {}  # key: param tuple, value: list of (spec, charge)
+        # Get current parameter set (as a tuple for dict key)
+        params = tuple(sorted(self.confirmed_params.items())) if self.confirmed_params else None
+        if params is not None:
+            # Add this measurement to the history for this parameter set
+            entry = self._pareto_param_history.setdefault(params, [])
+            entry.append((metrics.get('spec'), metrics.get('charge')))
+            # Only keep the last N (shots_spin) measurements for stability calculation
+            N = self.shots_spin.value()
+            if len(entry) > N:
+                entry[:] = entry[-N:]
+            # Compute mean spec, mean charge, and stability (coefficient of variation of spec)
+            import numpy as np
+            arr = np.array(entry)
+            mean_spec = float(np.mean(arr[:,0]))
+            mean_charge = float(np.mean(arr[:,1]))
+            # Stability: coefficient of variation (std/mean) of spec (or charge)
+            stability = float(np.std(arr[:,0]) / mean_spec) if mean_spec != 0 else 0.0
+            # Update or add to pareto_data (replace if param set already exists)
+            found = False
+            for d in self.pareto_data:
+                if d['params'] == params:
+                    d['spec'] = mean_spec
+                    d['charge'] = mean_charge
+                    d['stability'] = stability
+                    found = True
+                    break
+            if not found:
+                self.pareto_data.append({'spec': mean_spec, 'charge': mean_charge, 'stability': stability, 'params': params})
+            self.update_pareto_plot()
 
     def confirm_parameters(self):
         params = {}
@@ -686,6 +796,59 @@ class LPAControlGUI(QMainWindow):
         if hasattr(self, '_pending_worker') and self._pending_worker:
             self._pending_worker.on_param_confirmed(params)
             self._pending_worker = None
+
+    def update_pareto_plot(self):
+        """Update the Pareto plot with current self.pareto_data."""
+        import numpy as np
+        if not self.pareto_data:
+            self.pareto_scatter.setData([], [])
+            if self.pareto_colorbar:
+                self.pareto_colorbar.hide()
+            return
+        specs = np.array([d['spec'] for d in self.pareto_data])
+        charges = np.array([d['charge'] for d in self.pareto_data])
+        stabs = np.array([d['stability'] for d in self.pareto_data])
+        # Normalize stability for color mapping
+        stab_norm = (stabs - stabs.min()) / (stabs.ptp() if stabs.ptp() else 1)
+        colors = [pg.intColor(int(s*255), 255, alpha=200) for s in stab_norm]
+        self.pareto_scatter.setData(specs, charges, symbol='o', symbolBrush=colors, symbolSize=12)
+        # Add/update colorbar
+        if self.pareto_colorbar is None:
+            self.pareto_colorbar = pg.ColorBarItem(values=(stabs.min(), stabs.max()), cmap='viridis')
+            self.pareto_colorbar.setImageItem(self.pareto_scatter)
+            self.pareto_colorbar.setLevels((stabs.min(), stabs.max()))
+            self.pareto_colorbar.setParentItem(self.pareto_plot.getPlotItem())
+        else:
+            self.pareto_colorbar.setLevels((stabs.min(), stabs.max()))
+            self.pareto_colorbar.show()
+
+    def reset_plots_and_analysis(self):
+        """Clear all plots and analysis data, including Pareto plot."""
+        for hist in self.history.values():
+            hist.clear()
+        for c in self.curves.values():
+            c.setData([], [])
+        self.shot_number = 0
+        self.pareto_data.clear()
+        self.update_pareto_plot()
+        self.log_activity("Plots and analysis reset.")
+
+    def _on_pareto_click(self, event):
+        """Handle mouse click on Pareto plot: show params for nearest point."""
+        import numpy as np
+        if not self.pareto_data:
+            return
+        mouse_point = self.pareto_plot.getPlotItem().vb.mapSceneToView(event.scenePos())
+        mx, my = mouse_point.x(), mouse_point.y()
+        specs = np.array([d['spec'] for d in self.pareto_data])
+        charges = np.array([d['charge'] for d in self.pareto_data])
+        dists = np.hypot(specs - mx, charges - my)
+        idx = np.argmin(dists)
+        if dists[idx] < 0.1 * max(1, np.ptp(specs), np.ptp(charges)):  # Only if close enough
+            params = self.pareto_data[idx].get('params', {})
+            msg = f"Pareto point:\nSpec: {specs[idx]:.3g}, Charge: {charges[idx]:.3g}\nStability: {self.pareto_data[idx]['stability']:.3g}\nParams: {params}"
+            from PyQt5.QtWidgets import QMessageBox
+            QMessageBox.information(self, "Pareto Point Details", msg)
 
 if __name__=='__main__':
     app = QApplication(sys.argv)

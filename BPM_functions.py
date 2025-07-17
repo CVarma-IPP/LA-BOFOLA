@@ -37,7 +37,6 @@ from matplotlib.widgets import PolygonSelector, Slider, Button
 import matplotlib.image as mpimg
 # %matplotlib qt
 
-
 # Functions for BPM analysis
 
 def create_BPM_calibration(screen_width_mm, screen_length_mm):

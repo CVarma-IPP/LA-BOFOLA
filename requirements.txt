@@ -10,6 +10,7 @@ scipy>=1.7
 scikit-image>=0.19
 imageio>=2.9
 tifffile>=2021.7
+opencv-python>=4.5
 
 # File dialogs and utilities
 # Note: easygui requires tkinter, which must be installed via your system package manager.
