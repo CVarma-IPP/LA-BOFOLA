@@ -6,7 +6,7 @@ from collections import deque      # Efficient fixed-length queue for plotting
 
 # PyQt5 widgets and layouts
 from PyQt5.QtWidgets import (
-    QApplication, QWidget, QVBoxLayout, QHBoxLayout,
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QFileDialog, QTextEdit, QDoubleSpinBox,
     QGroupBox, QFormLayout, QSizePolicy
 )
@@ -100,8 +100,29 @@ class NewFileHandler(FileSystemEventHandler):
         if not path.lower().endswith(('.csv', '.txt', '.dat', '.wave')):
             return
 
-        # Brief pause to ensure the file is fully written
-        time.sleep(0.1)
+        # Start analysis in a separate thread for responsiveness
+        from threading import Thread
+        Thread(target=self._analyze_file_thread, args=(path,)).start()
+
+    def _analyze_file_thread(self, path):
+        import shutil
+        # Wait until file is stable (not growing) before processing
+        stable = False
+        last_size = -1
+        for _ in range(20):  # up to 2 seconds
+            try:
+                size = os.path.getsize(path)
+            except Exception:
+                time.sleep(0.05)
+                continue
+            if size == last_size and size > 0:
+                stable = True
+                break
+            last_size = size
+            time.sleep(0.1)
+        if not stable:
+            self.log.append(f"[ERROR] File not stable: {os.path.basename(path)}")
+            return
 
         # Pull current calibration values from the GUI and apply them
         val1, val2 = self.param_getter()
@@ -112,8 +133,14 @@ class NewFileHandler(FileSystemEventHandler):
         try:
             charge = ict_analysis.analyze_file(path)
         except Exception as e:
-            # On error, show a red “ERROR” line in the log
+            # On error, show a red “ERROR” line in the log and move file to error folder
             self.log.append(f"[ERROR] analyzing {os.path.basename(path)}: {e}")
+            error_dir = os.path.join(self.out_dir, "error_files")
+            os.makedirs(error_dir, exist_ok=True)
+            try:
+                shutil.move(path, os.path.join(error_dir, os.path.basename(path)))
+            except Exception as move_err:
+                self.log.append(f"[ERROR] Could not move file to error folder: {move_err}")
             return
 
         # Successful: increment our shot count
@@ -127,15 +154,19 @@ class NewFileHandler(FileSystemEventHandler):
         out_path = os.path.join(self.out_dir, out_name)
 
         # Write the analysis result (charge in pC) to that file
-        with open(out_path, 'w') as f:
-            f.write(f"charge_pC: {charge:.6f}\n")
+        try:
+            with open(out_path, 'w') as f:
+                f.write(f"charge_pC: {charge:.6f}\n")
+        except Exception as e:
+            self.log.append(f"[ERROR] Could not write analysis file: {e}")
+            return
 
         # Log success and update the live plot
         self.log.append(f"✔ {base} → {out_name} (Charge: {charge:.2f} pC)")
         self.plot_canvas.update_plot(self.shot_counter, charge)
 
 
-class MainWindow(QWidget):
+class MainWindow(QMainWindow):
     """
     The main application window:
      - Lets you choose an input folder to watch
@@ -152,8 +183,19 @@ class MainWindow(QWidget):
         self.in_dir = ''
         self.out_dir = ''
 
-        # --- Calibration controls ---
-        params_box = QGroupBox("Calibration Parameters")
+        # --- Main layout: horizontal split ---
+        main_layout = QHBoxLayout()
+        main_layout.setContentsMargins(20, 20, 20, 20)
+        main_layout.setSpacing(18)
+
+        # --- Sidebar for controls ---
+        sidebar = QVBoxLayout()
+        sidebar.setSpacing(12)
+        sidebar.setAlignment(Qt.AlignmentFlag.AlignTop)
+
+        # Calibration group
+        calib_group = QGroupBox("Calibration Parameters")
+        calib_group.setStyleSheet("font-weight: bold;")
         form = QFormLayout()
         self.spin_val1 = QDoubleSpinBox()
         self.spin_val1.setDecimals(6)
@@ -165,33 +207,88 @@ class MainWindow(QWidget):
         self.spin_val2.setValue(ict_analysis.VAL2)
         form.addRow("VAL1:", self.spin_val1)
         form.addRow("VAL2:", self.spin_val2)
-        params_box.setLayout(form)
+        calib_group.setLayout(form)
+        sidebar.addWidget(calib_group)
 
-        # --- Folder selection ---
-        self.btn_in = QPushButton("Select input folder…")
+        # Folder selection group
+        folder_group = QGroupBox("Folder Selection")
+        folder_layout = QVBoxLayout()
+        self.btn_in = QPushButton("Select Input Folder…")
         self.lbl_in = QLabel("<i>No input folder selected</i>")
-        self.btn_out = QPushButton("Select output folder…")
+        self.btn_out = QPushButton("Select Output Folder…")
         self.lbl_out = QLabel("<i>No output folder selected</i>")
+        folder_layout.addWidget(self.btn_in)
+        folder_layout.addWidget(self.lbl_in)
+        folder_layout.addWidget(self.btn_out)
+        folder_layout.addWidget(self.lbl_out)
+        folder_group.setLayout(folder_layout)
+        sidebar.addWidget(folder_group)
 
-        # --- Activity log (read-only text area) ---
+        # Activity log group
+        log_group = QGroupBox("Activity Log")
+        log_layout = QVBoxLayout()
         self.log = QTextEdit()
         self.log.setReadOnly(True)
         self.log.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        log_layout.addWidget(self.log)
+        log_group.setLayout(log_layout)
+        sidebar.addWidget(log_group)
 
-        # --- Live plot canvas ---
+        sidebar.addStretch(1)
+
+        # --- Main plot area ---
+        plot_group = QGroupBox("Charge vs. Shot Number")
+        plot_layout = QVBoxLayout()
         self.plot_canvas = PlotCanvas(self, maxshots=50)
         self.plot_canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        plot_layout.addWidget(self.plot_canvas)
+        plot_group.setLayout(plot_layout)
 
-        # --- Layout everything vertically ---
-        main = QVBoxLayout(self)
-        main.addWidget(params_box)
-        main.addWidget(self.btn_in)
-        main.addWidget(self.lbl_in)
-        main.addWidget(self.btn_out)
-        main.addWidget(self.lbl_out)
-        main.addWidget(self.plot_canvas)
-        main.addWidget(QLabel("Activity log:"))
-        main.addWidget(self.log)
+        # --- Compose main layout ---
+        main_layout.addLayout(sidebar, 0)
+        main_layout.addWidget(plot_group, 1)
+
+        # --- Set color scheme and style ---
+        self.setStyleSheet("""
+            QMainWindow {
+                background-color: #f5f6fa;
+            }
+            QGroupBox {
+                border: 1.5px solid #b2bec3;
+                border-radius: 8px;
+                margin-top: 10px;
+                background-color: #ffffff;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 3px 0 3px;
+                color: #636e72;
+            }
+            QPushButton {
+                background-color: #0984e3;
+                color: white;
+                border-radius: 6px;
+                padding: 7px 18px;
+                font-size: 11pt;
+            }
+            QPushButton:hover {
+                background-color: #74b9ff;
+            }
+            QLabel {
+                color: #2d3436;
+            }
+            QTextEdit {
+                background: #f8fafd;
+                border-radius: 6px;
+                font-size: 10pt;
+            }
+        """)
+
+        # --- Set main widget ---
+        container = QWidget()
+        container.setLayout(main_layout)
+        self.setCentralWidget(container)
 
         # --- Connect button clicks to folder-choosing methods ---
         self.btn_in.clicked.connect(self.choose_input)
