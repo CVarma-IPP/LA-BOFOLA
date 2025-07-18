@@ -140,20 +140,20 @@ def save_calibration_data():
         print("No distance on screen to energy calibration file selected. Exiting.")
         return
     
-    # Prompt the user to select the tracking distance file
-    tracking_distance_file = easygui.fileopenbox(msg="Select Tracking Distance File", filetypes=["*.txt"])
+    # # Prompt the user to select the tracking distance file
+    # tracking_distance_file = easygui.fileopenbox(msg="Select Tracking Distance File", filetypes=["*.txt"])
 
-    if not tracking_distance_file:
-        print("No tracking distance file selected. Exiting.")
-        return
+    # if not tracking_distance_file:
+    #     print("No tracking distance file selected. Exiting.")
+    #     return
     
     # Read the data from the ds_dE file
-    data = np.loadtxt(distance_energy_calibration_file)
+    data = np.loadtxt(distance_energy_calibration_file, skiprows=1)
 
     # Extract the first, second, and third columns
     energy = data[:, 0]
-    distance = -data[:, 2]
-    ds_dE = -data[:, 1]
+    distance = data[:, 2]
+    d_source = data[:, 1]
     
     # Create an interpolation function for the energy distance conversion
     energy_interpolator = interp1d(distance, energy, kind='linear', fill_value='extrapolate')
@@ -164,8 +164,8 @@ def save_calibration_data():
     # Create the interpolator for the charge conservation calculations
     dE_ds_interpolator = interp1d(distance, (dE_ds), kind = 'slinear') # !!! Try to make it smoother !!!
 
-    # Read the data from the d_source file
-    d_source = np.loadtxt(tracking_distance_file)
+    # # Read the data from the d_source file
+    # d_source = np.loadtxt(tracking_distance_file)
 
     # Estimating the average distance covered by electrons !!! Needs to be improved/finalized !!!
     average_distance_covered= np.mean(d_source)
@@ -176,8 +176,8 @@ def save_calibration_data():
     
     # Plot energy against distance and ds_dE
     plt.figure()
-    plt.plot(ds_dE, energy, '.', color='green', label='ds_dE')
-    plt.plot(distance, ds_dE, '.', color='green', label='ds_dE')
+    # plt.plot(ds_dE, energy, '.', color='green', label='ds_dE')
+    # plt.plot(distance, ds_dE, '.', color='green', label='ds_dE')
     plt.plot(distance, energy, '.', color='b', label='data')
 
     # Plot the calculated derivative on top
@@ -263,7 +263,7 @@ def save_calibration_data():
     with open(filename, 'w') as f:
         f.write(f"Calibration Image='{calib_image_path}';\n\n")
         f.write(f"Distance to Energy Calibration File='{distance_energy_calibration_file}';\n\n")
-        f.write(f"Tracking Distance File='{tracking_distance_file}';\n\n")
+        # f.write(f"Tracking Distance File='{tracking_distance_file}';\n\n")
         f.write(f"Average Distance Covered={average_distance_covered};\n\n")
         f.write(f"Corner_TL_x={TL_x};\n\n")
         f.write(f"Corner_TL_y={TL_y};\n\n")
