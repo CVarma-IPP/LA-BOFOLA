@@ -14,6 +14,7 @@ from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 from matplotlib import gridspec
 from watchdog.observers import Observer
+from watchdog.observers.polling import PollingObserver
 from watchdog.events import FileSystemEventHandler
 import imageio
 import Analysis_code_functions as acf
@@ -176,13 +177,14 @@ def process_image_v2(img: np.ndarray, calib: dict, ROI_selection_percent: float 
 
 class GuiSignals(QObject):
     log_message = pyqtSignal(str)
+    new_file = pyqtSignal(str)
 
 class NewFileHandler(FileSystemEventHandler):
     def __init__(self, gui):
         self.gui = gui
-        self.shot = 0
         self.signals = GuiSignals()
         self.signals.log_message.connect(gui.log.append)
+        self.signals.new_file.connect(gui.handle_new_file)
 
     def on_created(self, event):
         # Triggered when a new file appears in the watched folder
@@ -191,140 +193,9 @@ class NewFileHandler(FileSystemEventHandler):
         path = event.src_path
         if not path.lower().endswith(('.tif', '.tiff', '.png', '.jpg')):
             return
-
         filename = os.path.basename(path)
-        gui = self.gui
         self.signals.log_message.emit(f"[INFO] New file detected: {filename}")
-
-        # Don’t attempt processing until a calibration is loaded
-        if gui.calib is None:
-            return
-
-        # Give the OS a moment to finish writing the file
-        max_attempts = 50  # Increase attempts for slow file systems
-        last_size = -1
-        stable_count = 0
-        time.sleep(0.05)  # Initial short delay before first attempt
-        for attempt in range(max_attempts):
-            try:
-                size = os.path.getsize(path)
-                if size == last_size and size > 0:
-                    stable_count += 1
-                else:
-                    stable_count = 0
-                last_size = size
-                # Try to open the file in binary mode to check accessibility
-                with open(path, 'rb'):
-                    pass
-                if stable_count >= 2:
-                    img = iio.imread(path)
-                    break
-            except (PermissionError, OSError) as e:
-                gui.log.append(f"[INFO] File read attempt {attempt+1} failed: {e}")
-            time.sleep(0.05)
-        else:
-            gui.log.append(f"[WARN] Cannot read file (locked or incomplete): {filename}")
-            return
-
-        # Prepare the image
-        espec_img = img.astype(np.float32)
-
-        # Run the processing pipeline (returns both full and masked arrays)
-        try:
-            postPT, spec2D, e_axis, full1D, div_vals, div_axis, m_e, m_spec = process_image_v2(
-                img=espec_img,
-                calib=gui.calib,
-                ROI_selection_percent=0.65,
-                fine_cut_flag=True,
-                bg_flag=True,
-                PT_flag=True,
-                norm_flag=False,
-                emin=gui.spin_minE.value(),
-                emax=gui.spin_maxE.value(),
-                burn_ranges=parse_burnt_ranges(gui.edit_burnt.text())
-            )
-
-            # Mask the divergence values to the same energy window
-            emin, emax = gui.spin_minE.value(), gui.spin_maxE.value()
-            div_mask = (div_axis >= emin) & (div_axis <= emax)
-            m_div_axis = div_axis[div_mask]
-            m_div_vals = np.array(div_vals)[div_mask]
-
-            # Increment the shot counter
-            self.shot += 1
-
-            # Build the Nx2 masked experimental spectrum array to be sent for scoring
-            exp_spec = np.column_stack((m_e, m_spec))
-            
-            # Pull all thresholds from the GUI
-            emin = gui.spin_minE.value()
-            emax = gui.spin_maxE.value()
-            # lowE_th    = gui.spin_lowE_th.value()               # e.g. a QDoubleSpinBox you added
-            target_peak   = gui.spin_target_peak.value()
-            worst_cost    = gui.spin_cost.value()   
-
-            # score **masked** spectrum
-            target = lambda e: ftes.aimed_spectrum(e, peak=gui.spin_target_peak.value(), sigma=gui.spin_target_sigma.value())
-            
-            # Then call v3
-            score_dict = ftes.evaluate_spectrum_v3(
-                exp_spectrum          = exp_spec,
-                target_spectrum_func  = target,
-                region                = (emin, emax),  
-                low_energy_threshold  = 50.0,                       # or gui.spin_lowE_th.value()
-                target_peak           = gui.spin_target_peak.value(),
-                weights = {
-                    'shape':      gui.spin_w_shape.value(),
-                    'peak_pos':   gui.spin_w_peak.value(),
-                    'spread':     gui.spin_w_spread.value(),
-                    'low_energy': gui.spin_w_lowE.value(),
-                    'kurtosis':   gui.spin_w_kurt.value(),
-                    'multipeak':  gui.spin_w_multipeak.value(),
-                    'overshoot':  gui.spin_w_overshoot.value(),
-                },
-                worst_cost = gui.spin_cost.value()                  # if you want to pass it here
-            )
-
-            # Update the GUI plots with masked intensity & divergence
-            gui.plot_canvas.update_plots(
-                post_PT=postPT,
-                spec2D=spec2D,
-                energy_axis=e_axis,
-                masked_energy=m_e,
-                masked_intensity=m_spec,
-                pixel2mm=gui.calib['pixel2mm'],
-                score_dict=score_dict,
-                target_peak=gui.spin_target_peak.value(),
-                target_sigma=gui.spin_target_sigma.value()
-            )
-
-            # Update the GUI labels with the score breakdown    
-            gui.lbl_score_shape.setText(f"{score_dict['shape']:.2f}")
-            gui.lbl_score_peak.setText(f"{score_dict['peak']:.2f}")
-            gui.lbl_score_spread.setText(f"{score_dict['spread']:.2f}")
-            gui.lbl_score_kurt.setText(f"{score_dict['kurtosis']:.2f}")
-            gui.lbl_score_multipeak.setText(f"{score_dict['multipeak']:.2f}")
-            gui.lbl_score_lowE.setText(f"{score_dict['low']:.2f}")
-            gui.lbl_score_overshoot.setText(f"{score_dict['over']:.2f}")
-
-            # Display the raw cost next to the worst cost
-            gui.lbl_score_totalcost.setText(f"{score_dict['raw']:.2f}")
-
-            # Log the cost and score
-            txt = (f"Shot {self.shot} → Score {score_dict['score']:.2f}  "
-                f"(raw cost={score_dict['raw']:.2f})")
-            gui.log.append(txt)
-
-            # save summary
-            if gui.output_folder:
-                fname = os.path.join(gui.output_folder, f"shot_{self.shot}_summary.txt")
-                with open(fname, 'w', encoding='utf-8') as f:
-                    f.write(txt + "\n")
-        except Exception as ex:
-            gui.log.append(f"[ERROR] Processing failed: {ex}")
-            import traceback
-            gui.log.append(traceback.format_exc())
-            return
+        self.signals.new_file.emit(path)
 
 class PlotCanvas(FigureCanvas):
     def __init__(self, parent=None):
@@ -489,6 +360,106 @@ class PlotCanvas(FigureCanvas):
         self.draw()  # Redraw the canvas to update the plots
 
 class MainWindow(QMainWindow):
+    def handle_new_file(self, path):
+        # This runs in the main Qt thread
+        if self.calib is None:
+            return
+        # Wait for file to be fully written
+        max_attempts = 50
+        last_size = -1
+        stable_count = 0
+        time.sleep(0.05)
+        for attempt in range(max_attempts):
+            try:
+                size = os.path.getsize(path)
+                if size == last_size and size > 0:
+                    stable_count += 1
+                else:
+                    stable_count = 0
+                last_size = size
+                with open(path, 'rb'):
+                    pass
+                if stable_count >= 2:
+                    img = iio.imread(path)
+                    break
+            except (PermissionError, OSError) as e:
+                self.log.append(f"[INFO] File read attempt {attempt+1} failed: {e}")
+            time.sleep(0.05)
+        else:
+            self.log.append(f"[WARN] Cannot read file (locked or incomplete): {os.path.basename(path)}")
+            return
+        espec_img = img.astype(np.float32)
+        try:
+            postPT, spec2D, e_axis, full1D, div_vals, div_axis, m_e, m_spec = process_image_v2(
+                img=espec_img,
+                calib=self.calib,
+                ROI_selection_percent=0.65,
+                fine_cut_flag=True,
+                bg_flag=True,
+                PT_flag=True,
+                norm_flag=False,
+                emin=self.spin_minE.value(),
+                emax=self.spin_maxE.value(),
+                burn_ranges=parse_burnt_ranges(self.edit_burnt.text())
+            )
+            emin, emax = self.spin_minE.value(), self.spin_maxE.value()
+            div_mask = (div_axis >= emin) & (div_axis <= emax)
+            m_div_axis = div_axis[div_mask]
+            m_div_vals = np.array(div_vals)[div_mask]
+            if not hasattr(self, 'shot'):
+                self.shot = 1
+            else:
+                self.shot += 1
+            exp_spec = np.column_stack((m_e, m_spec))
+            target = lambda e: ftes.aimed_spectrum(e, peak=self.spin_target_peak.value(), sigma=self.spin_target_sigma.value())
+            score_dict = ftes.evaluate_spectrum_v3(
+                exp_spectrum          = exp_spec,
+                target_spectrum_func  = target,
+                region                = (emin, emax),  
+                low_energy_threshold  = 50.0,
+                target_peak           = self.spin_target_peak.value(),
+                weights = {
+                    'shape':      self.spin_w_shape.value(),
+                    'peak_pos':   self.spin_w_peak.value(),
+                    'spread':     self.spin_w_spread.value(),
+                    'low_energy': self.spin_w_lowE.value(),
+                    'kurtosis':   self.spin_w_kurt.value(),
+                    'multipeak':  self.spin_w_multipeak.value(),
+                    'overshoot':  self.spin_w_overshoot.value(),
+                },
+                worst_cost = self.spin_cost.value()
+            )
+            self.plot_canvas.update_plots(
+                post_PT=postPT,
+                spec2D=spec2D,
+                energy_axis=e_axis,
+                masked_energy=m_e,
+                masked_intensity=m_spec,
+                pixel2mm=self.calib['pixel2mm'],
+                score_dict=score_dict,
+                target_peak=self.spin_target_peak.value(),
+                target_sigma=self.spin_target_sigma.value()
+            )
+            self.lbl_score_shape.setText(f"{score_dict['shape']:.2f}")
+            self.lbl_score_peak.setText(f"{score_dict['peak']:.2f}")
+            self.lbl_score_spread.setText(f"{score_dict['spread']:.2f}")
+            self.lbl_score_kurt.setText(f"{score_dict['kurtosis']:.2f}")
+            self.lbl_score_multipeak.setText(f"{score_dict['multipeak']:.2f}")
+            self.lbl_score_lowE.setText(f"{score_dict['low']:.2f}")
+            self.lbl_score_overshoot.setText(f"{score_dict['over']:.2f}")
+            self.lbl_score_totalcost.setText(f"{score_dict['raw']:.2f}")
+            txt = (f"Shot {self.shot} → Score {score_dict['score']:.2f}  "
+                f"(raw cost={score_dict['raw']:.2f})")
+            self.log.append(txt)
+            if self.output_folder:
+                fname = os.path.join(self.output_folder, f"shot_{self.shot}_summary.txt")
+                with open(fname, 'w', encoding='utf-8') as f:
+                    f.write(txt + "\n")
+        except Exception as ex:
+            self.log.append(f"[ERROR] Processing failed: {ex}")
+            import traceback
+            self.log.append(traceback.format_exc())
+            return
     def __init__(self):
         super().__init__()
         self.setWindowTitle('ESPEC Live Analysis')
@@ -507,6 +478,7 @@ class MainWindow(QMainWindow):
 
         # Left Control Panel
         control = QWidget()
+        control.setFixedWidth(350)  # Fixed sidebar width
         control_layout = QVBoxLayout(control)
 
         # Calibration Group
@@ -526,6 +498,9 @@ class MainWindow(QMainWindow):
         in_layout = QHBoxLayout()
         in_layout.addWidget(QLabel('Input:'))
         self.lbl_in = QLabel('None')
+        self.lbl_in.setMinimumWidth(120)
+        self.lbl_in.setMaximumWidth(180)
+        self.lbl_in.setTextInteractionFlags(Qt.TextSelectableByMouse)
         in_layout.addWidget(self.lbl_in)
         self.btn_in = QPushButton('Select Input…')
         in_layout.addWidget(self.btn_in)
@@ -533,6 +508,9 @@ class MainWindow(QMainWindow):
         out_layout = QHBoxLayout()
         out_layout.addWidget(QLabel('Output:'))
         self.lbl_out = QLabel('None')
+        self.lbl_out.setMinimumWidth(120)
+        self.lbl_out.setMaximumWidth(180)
+        self.lbl_out.setTextInteractionFlags(Qt.TextSelectableByMouse)
         out_layout.addWidget(self.lbl_out)
         self.btn_out = QPushButton('Select Output…')
         out_layout.addWidget(self.btn_out)
@@ -725,15 +703,24 @@ class MainWindow(QMainWindow):
         path = QFileDialog.getExistingDirectory(self, 'Select Input Folder')
         if path:
             self.input_folder = path
-            self.lbl_in.setText(path)
+            self.lbl_in.setText(self._elide_path(path, self.lbl_in))
+            self.lbl_in.setToolTip(path)  # Show full path on hover
             self.restart_observer()
 
     def select_output_folder(self):
         path = QFileDialog.getExistingDirectory(self, 'Select Output Folder')
         if path:
             self.output_folder = path
-            self.lbl_out.setText(path)
+            self.lbl_out.setText(self._elide_path(path, self.lbl_out))
+            self.lbl_out.setToolTip(path)  # Show full path on hover
             self.restart_observer()
+    def _elide_path(self, path, label):
+        """
+        Truncate the path with ellipsis if it exceeds the label's max width.
+        """
+        metrics = label.fontMetrics()
+        max_width = label.maximumWidth() if label.maximumWidth() > 0 else 180
+        return metrics.elidedText(path, Qt.ElideMiddle, max_width)
 
     def restart_observer(self):
         if self.observer:
@@ -743,7 +730,8 @@ class MainWindow(QMainWindow):
         if self.input_folder and self.output_folder and self.calib:
             try:
                 handler = NewFileHandler(self)
-                self.observer = Observer()
+                # Use PollingObserver for network folder compatibility
+                self.observer = PollingObserver()
                 self.observer.schedule(handler, self.input_folder, recursive=False)
                 self.observer.start()
                 self.log.append(f'Watching {self.input_folder}')
