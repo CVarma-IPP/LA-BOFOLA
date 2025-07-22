@@ -127,7 +127,7 @@ def process_image_v2(img: np.ndarray, calib: dict, ROI_selection_percent: float 
         calib['screen_to_axis_distance'] + w * calib['pixel2mm'],
         w    )
 
-    print(f"Screen distance axis (mm): max={max(screen_mm)}, min={min(screen_mm)}")
+    # print(f"Screen distance axis (mm): max={max(screen_mm)}, min={min(screen_mm)}")
     # mm → energy
     energy_axis = calib['energy_interp'](screen_mm)
 
@@ -183,8 +183,9 @@ class NewFileHandler(FileSystemEventHandler):
     def __init__(self, gui):
         self.gui = gui
         self.signals = GuiSignals()
-        self.signals.log_message.connect(gui.log.append)
-        self.signals.new_file.connect(gui.handle_new_file)
+        # Use Qt.ConnectionType.QueuedConnection to ensure thread safety
+        self.signals.log_message.connect(gui.log.append, Qt.ConnectionType.QueuedConnection)
+        self.signals.new_file.connect(gui.handle_new_file, Qt.ConnectionType.QueuedConnection)
 
     def on_created(self, event):
         # Triggered when a new file appears in the watched folder
@@ -359,107 +360,133 @@ class PlotCanvas(FigureCanvas):
 
         self.draw()  # Redraw the canvas to update the plots
 
-class MainWindow(QMainWindow):
-    def handle_new_file(self, path):
-        # This runs in the main Qt thread
-        if self.calib is None:
-            return
-        # Wait for file to be fully written
-        max_attempts = 50
-        last_size = -1
-        stable_count = 0
-        time.sleep(0.05)
-        for attempt in range(max_attempts):
-            try:
-                size = os.path.getsize(path)
-                if size == last_size and size > 0:
-                    stable_count += 1
-                else:
-                    stable_count = 0
-                last_size = size
-                with open(path, 'rb'):
-                    pass
-                if stable_count >= 2:
-                    img = iio.imread(path)
-                    break
-            except (PermissionError, OSError) as e:
-                self.log.append(f"[INFO] File read attempt {attempt+1} failed: {e}")
-            time.sleep(0.05)
-        else:
-            self.log.append(f"[WARN] Cannot read file (locked or incomplete): {os.path.basename(path)}")
-            return
-        espec_img = img.astype(np.float32)
+class AnalysisWorker(QThread):
+    result_ready = pyqtSignal(dict)
+    error = pyqtSignal(str)
+    def __init__(self, gui, path):
+        super().__init__()
+        self.gui = gui
+        self.path = path
+    
+    def run(self):
+        import time
+        print(f'[DEBUG] AnalysisWorker started for {self.path}')
         try:
+            # --- Robust file readiness logic ---
+            max_wait = 10.0  # seconds
+            min_stable_checks = 3
+            backoff = 0.05   # initial sleep (seconds)
+            max_backoff = 0.5
+            stable_count = 0
+            last_size = -1
+            start_time = time.time()
+            img = None
+
+            while True:
+                try:
+                    size = os.path.getsize(self.path)
+                    if size == last_size and size > 0:
+                        stable_count += 1
+                    else:
+                        stable_count = 0
+                    last_size = size
+
+                    if stable_count >= min_stable_checks:
+                        # Try to read header and image
+                        with open(self.path, 'rb') as f:
+                            header = f.read(1024)
+                            if len(header) < 8:
+                                raise ValueError("File too small")
+                        test_img = iio.imread(self.path)
+                        if test_img is not None and hasattr(test_img, 'size') and test_img.size > 0:
+                            img = test_img
+                            break
+                        else:
+                            raise ValueError("Empty or invalid image")
+                except (ValueError, OSError, PermissionError) as read_error:
+                    stable_count = 0
+                except (PermissionError, OSError, FileNotFoundError):
+                    pass
+
+                if time.time() - start_time > max_wait:
+                    self.error.emit(f"[WARN] Cannot read file after {max_wait:.1f}s (locked, incomplete, or corrupted): {os.path.basename(self.path)}")
+                    return
+                time.sleep(backoff)
+                backoff = min(backoff * 1.5, max_backoff)
+            # --- End file readiness logic ---
+
+            espec_img = img.astype(np.float32)
+            gui = self.gui
+            emin = gui.spin_minE.value()
+            emax = gui.spin_maxE.value()
+            burnt_ranges = parse_burnt_ranges(gui.edit_burnt.text())
+            target_peak = gui.spin_target_peak.value()
+            target_sigma = gui.spin_target_sigma.value()
+            w_shape = gui.spin_w_shape.value()
+            w_peak = gui.spin_w_peak.value()
+            w_spread = gui.spin_w_spread.value()
+            w_lowE = gui.spin_w_lowE.value()
+            w_kurt = gui.spin_w_kurt.value()
+            w_multipeak = gui.spin_w_multipeak.value()
+            w_overshoot = gui.spin_w_overshoot.value()
+            worst_cost = gui.spin_cost.value()
             postPT, spec2D, e_axis, full1D, div_vals, div_axis, m_e, m_spec = process_image_v2(
                 img=espec_img,
-                calib=self.calib,
+                calib=gui.calib,
                 ROI_selection_percent=0.65,
                 fine_cut_flag=True,
                 bg_flag=True,
                 PT_flag=True,
                 norm_flag=False,
-                emin=self.spin_minE.value(),
-                emax=self.spin_maxE.value(),
-                burn_ranges=parse_burnt_ranges(self.edit_burnt.text())
+                emin=emin,
+                emax=emax,
+                burn_ranges=burnt_ranges
             )
-            emin, emax = self.spin_minE.value(), self.spin_maxE.value()
             div_mask = (div_axis >= emin) & (div_axis <= emax)
             m_div_axis = div_axis[div_mask]
             m_div_vals = np.array(div_vals)[div_mask]
-            if not hasattr(self, 'shot'):
-                self.shot = 1
+            if not hasattr(gui, 'shot'):
+                gui.shot = 1
             else:
-                self.shot += 1
+                gui.shot += 1
             exp_spec = np.column_stack((m_e, m_spec))
-            target = lambda e: ftes.aimed_spectrum(e, peak=self.spin_target_peak.value(), sigma=self.spin_target_sigma.value())
+            target = lambda e: ftes.aimed_spectrum(e, peak=target_peak, sigma=target_sigma)
             score_dict = ftes.evaluate_spectrum_v3(
                 exp_spectrum          = exp_spec,
                 target_spectrum_func  = target,
                 region                = (emin, emax),  
                 low_energy_threshold  = 50.0,
-                target_peak           = self.spin_target_peak.value(),
+                target_peak           = target_peak,
                 weights = {
-                    'shape':      self.spin_w_shape.value(),
-                    'peak_pos':   self.spin_w_peak.value(),
-                    'spread':     self.spin_w_spread.value(),
-                    'low_energy': self.spin_w_lowE.value(),
-                    'kurtosis':   self.spin_w_kurt.value(),
-                    'multipeak':  self.spin_w_multipeak.value(),
-                    'overshoot':  self.spin_w_overshoot.value(),
+                    'shape':      w_shape,
+                    'peak_pos':   w_peak,
+                    'spread':     w_spread,
+                    'low_energy': w_lowE,
+                    'kurtosis':   w_kurt,
+                    'multipeak':  w_multipeak,
+                    'overshoot':  w_overshoot,
                 },
-                worst_cost = self.spin_cost.value()
+                worst_cost = worst_cost
             )
-            self.plot_canvas.update_plots(
-                post_PT=postPT,
-                spec2D=spec2D,
-                energy_axis=e_axis,
-                masked_energy=m_e,
-                masked_intensity=m_spec,
-                pixel2mm=self.calib['pixel2mm'],
-                score_dict=score_dict,
-                target_peak=self.spin_target_peak.value(),
-                target_sigma=self.spin_target_sigma.value()
-            )
-            self.lbl_score_shape.setText(f"{score_dict['shape']:.2f}")
-            self.lbl_score_peak.setText(f"{score_dict['peak']:.2f}")
-            self.lbl_score_spread.setText(f"{score_dict['spread']:.2f}")
-            self.lbl_score_kurt.setText(f"{score_dict['kurtosis']:.2f}")
-            self.lbl_score_multipeak.setText(f"{score_dict['multipeak']:.2f}")
-            self.lbl_score_lowE.setText(f"{score_dict['low']:.2f}")
-            self.lbl_score_overshoot.setText(f"{score_dict['over']:.2f}")
-            self.lbl_score_totalcost.setText(f"{score_dict['raw']:.2f}")
-            txt = (f"Shot {self.shot} → Score {score_dict['score']:.2f}  "
-                f"(raw cost={score_dict['raw']:.2f})")
-            self.log.append(txt)
-            if self.output_folder:
-                fname = os.path.join(self.output_folder, f"shot_{self.shot}_summary.txt")
-                with open(fname, 'w', encoding='utf-8') as f:
-                    f.write(txt + "\n")
+            result = {
+                'postPT': postPT,
+                'spec2D': spec2D,
+                'e_axis': e_axis,
+                'm_e': m_e,
+                'm_spec': m_spec,
+                'score_dict': score_dict,
+                'shot': gui.shot
+            }
+            self.result_ready.emit(result)
+            print(f'[DEBUG] AnalysisWorker finished for {self.path}')
         except Exception as ex:
-            self.log.append(f"[ERROR] Processing failed: {ex}")
             import traceback
-            self.log.append(traceback.format_exc())
-            return
+            print(f'[ERROR] AnalysisWorker crashed for {self.path}: {ex}')
+            print(traceback.format_exc())
+            self.error.emit(f"[ERROR] Processing failed: {ex}\n{traceback.format_exc()}")
+
+class MainWindow(QMainWindow):
+       
     def __init__(self):
         super().__init__()
         self.setWindowTitle('ESPEC Live Analysis')
@@ -468,6 +495,11 @@ class MainWindow(QMainWindow):
         self.input_folder = None
         self.output_folder = None
         self.observer = None
+        self._closing = False  # Flag to track if window is closing
+        # self.batch_timer = None
+        # self.batch_files = []
+        # self.batch_index = 0
+        self._batch_workers = []  # Track running batch workers
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -500,20 +532,24 @@ class MainWindow(QMainWindow):
         self.lbl_in = QLabel('None')
         self.lbl_in.setMinimumWidth(120)
         self.lbl_in.setMaximumWidth(180)
-        self.lbl_in.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.lbl_in.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         in_layout.addWidget(self.lbl_in)
         self.btn_in = QPushButton('Select Input…')
         in_layout.addWidget(self.btn_in)
+        print('[DEBUG] Connecting btn_in to select_input_folder...')
+        self.btn_in.clicked.connect(self.select_input_folder)
         folders_layout.addLayout(in_layout)
         out_layout = QHBoxLayout()
         out_layout.addWidget(QLabel('Output:'))
         self.lbl_out = QLabel('None')
         self.lbl_out.setMinimumWidth(120)
         self.lbl_out.setMaximumWidth(180)
-        self.lbl_out.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.lbl_out.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         out_layout.addWidget(self.lbl_out)
         self.btn_out = QPushButton('Select Output…')
         out_layout.addWidget(self.btn_out)
+        print('[DEBUG] Connecting btn_out to select_output_folder...')
+        self.btn_out.clicked.connect(self.select_output_folder)
         folders_layout.addLayout(out_layout)
         control_layout.addWidget(folders_group)
 
@@ -551,19 +587,19 @@ class MainWindow(QMainWindow):
         self.spin_cost.setRange(-1e1, 1e3)
         self.spin_cost.setValue(70.0)
         self.spin_cost.setSingleStep(0.1)
-        # scoring_layout.addRow('Worst Cost:', self.spin_cost)
-        # — Worst Cost + live raw cost display —
         widget_cost = QWidget()
         h_cost = QHBoxLayout(widget_cost)
         h_cost.setContentsMargins(0,0,0,0)
         h_cost.addWidget(self.spin_cost)
-        #### Weights for shape scoring
+        self.lbl_score_totalcost = QLabel("0.00")
+        h_cost.addWidget(self.lbl_score_totalcost)
+        scoring_layout.addRow('Worst Cost:', widget_cost)
+
+        # Shape Weight
         self.spin_w_shape = QDoubleSpinBox()
         self.spin_w_shape.setRange(-1e2, 1e3)
         self.spin_w_shape.setSingleStep(0.1)
-        self.spin_w_shape.setValue(35.0)               # default
-        # scoring_layout.addRow('Shape Weight:', self.spin_w_shape)
-        # — Shape Weight + live score display —
+        self.spin_w_shape.setValue(35.0)
         widget_w_shape = QWidget()
         h_w_shape = QHBoxLayout(widget_w_shape)
         h_w_shape.setContentsMargins(0,0,0,0)
@@ -572,13 +608,11 @@ class MainWindow(QMainWindow):
         h_w_shape.addWidget(self.lbl_score_shape)
         scoring_layout.addRow("Shape Weight:", widget_w_shape)
 
-        #### Peak‐position weight
+        # Peak Position Weight
         self.spin_w_peak = QDoubleSpinBox()
         self.spin_w_peak.setRange(-1e2, 1e3)
         self.spin_w_peak.setSingleStep(0.1)
-        self.spin_w_peak.setValue(15.0)                # default 
-        # scoring_layout.addRow('Peak Pos Weight:', self.spin_w_peak)
-        # — Peak Pos Weight + live score display —
+        self.spin_w_peak.setValue(15.0)
         widget_w_peak = QWidget()
         h_w_peak = QHBoxLayout(widget_w_peak)
         h_w_peak.setContentsMargins(0,0,0,0)
@@ -586,14 +620,12 @@ class MainWindow(QMainWindow):
         self.lbl_score_peak = QLabel("0.00")
         h_w_peak.addWidget(self.lbl_score_peak)
         scoring_layout.addRow("Peak Pos Weight:", widget_w_peak)
-                
-        #### Weights for Spread scoring
-        self.spin_w_spread = QDoubleSpinBox(); 
-        self.spin_w_spread.setRange(-1e2, 1e3); 
+
+        # Spread Weight
+        self.spin_w_spread = QDoubleSpinBox()
+        self.spin_w_spread.setRange(-1e2, 1e3)
         self.spin_w_spread.setSingleStep(0.1)
-        self.spin_w_spread.setValue(5.0)               # default
-        # scoring_layout.addRow('Spread Weight:', self.spin_w_spread)
-        # — Spread Weight + live score display —
+        self.spin_w_spread.setValue(5.0)
         widget_w_spread = QWidget()
         h_w_spread = QHBoxLayout(widget_w_spread)
         h_w_spread.setContentsMargins(0,0,0,0)
@@ -602,13 +634,11 @@ class MainWindow(QMainWindow):
         h_w_spread.addWidget(self.lbl_score_spread)
         scoring_layout.addRow("Spread Weight:", widget_w_spread)
 
-        #### Weights for Kurtosis scoring
-        self.spin_w_kurt = QDoubleSpinBox(); 
-        self.spin_w_kurt.setRange(-1e2, 1e3); 
+        # Kurtosis Weight
+        self.spin_w_kurt = QDoubleSpinBox()
+        self.spin_w_kurt.setRange(-1e2, 1e3)
         self.spin_w_kurt.setSingleStep(0.1)
-        self.spin_w_kurt.setValue(0.1)                 # default
-        # scoring_layout.addRow('Kurtosis Weight:', self.spin_w_kurt)
-        # — Kurtosis Weight + live score display —
+        self.spin_w_kurt.setValue(0.1)
         widget_w_kurt = QWidget()
         h_w_kurt = QHBoxLayout(widget_w_kurt)
         h_w_kurt.setContentsMargins(0,0,0,0)
@@ -617,13 +647,11 @@ class MainWindow(QMainWindow):
         h_w_kurt.addWidget(self.lbl_score_kurt)
         scoring_layout.addRow("Kurtosis Weight:", widget_w_kurt)
 
-        #### Weights for Multi-peak scoring
-        self.spin_w_multipeak = QDoubleSpinBox(); 
-        self.spin_w_multipeak.setRange(-1e2, 1e3); 
+        # Multi-peak Weight
+        self.spin_w_multipeak = QDoubleSpinBox()
+        self.spin_w_multipeak.setRange(-1e2, 1e3)
         self.spin_w_multipeak.setSingleStep(0.1)
-        self.spin_w_multipeak.setValue(30.0)            # default
-        # scoring_layout.addRow('Multi-peak Weight:', self.spin_w_multipeak)
-        # — Multi-peak Weight + live score display —
+        self.spin_w_multipeak.setValue(30.0)
         widget_w_multipeak = QWidget()
         h_w_multipeak = QHBoxLayout(widget_w_multipeak)
         h_w_multipeak.setContentsMargins(0,0,0,0)
@@ -631,14 +659,12 @@ class MainWindow(QMainWindow):
         self.lbl_score_multipeak = QLabel("0.00")
         h_w_multipeak.addWidget(self.lbl_score_multipeak)
         scoring_layout.addRow("Multi-peak Weight:", widget_w_multipeak)
-        
-        #### Weights for Low-E penalty
-        self.spin_w_lowE = QDoubleSpinBox(); 
-        self.spin_w_lowE.setRange(-1e2, 1e3); 
+
+        # Low-E Penalty Weight
+        self.spin_w_lowE = QDoubleSpinBox()
+        self.spin_w_lowE.setRange(-1e2, 1e3)
         self.spin_w_lowE.setSingleStep(0.1)
-        self.spin_w_lowE.setValue(-1.5)                # default
-        # scoring_layout.addRow('Low-E Penalty Weight:', self.spin_w_lowE)
-        # — Low-E Penalty Weight + live score display —
+        self.spin_w_lowE.setValue(-1.5)
         widget_w_lowE = QWidget()
         h_w_lowE = QHBoxLayout(widget_w_lowE)
         h_w_lowE.setContentsMargins(0,0,0,0)
@@ -647,13 +673,11 @@ class MainWindow(QMainWindow):
         h_w_lowE.addWidget(self.lbl_score_lowE)
         scoring_layout.addRow("Low-E Penalty Weight:", widget_w_lowE)
 
-        #### Weights for Overshoot bonus
-        self.spin_w_overshoot = QDoubleSpinBox(); 
-        self.spin_w_overshoot.setRange(-1e2, 1e3); 
+        # Overshoot Bonus Weight
+        self.spin_w_overshoot = QDoubleSpinBox()
+        self.spin_w_overshoot.setRange(-1e2, 1e3)
         self.spin_w_overshoot.setSingleStep(0.1)
-        self.spin_w_overshoot.setValue(1.5)             # default
-        # scoring_layout.addRow('Overshoot Bonus Weight:', self.spin_w_overshoot)
-        # — Overshoot Bonus Weight + live score display —
+        self.spin_w_overshoot.setValue(1.5)
         widget_w_overshoot = QWidget()
         h_w_overshoot = QHBoxLayout(widget_w_overshoot)
         h_w_overshoot.setContentsMargins(0,0,0,0)
@@ -670,18 +694,36 @@ class MainWindow(QMainWindow):
         control_layout.addWidget(self.log)
         control_layout.addStretch()
 
-        # Right Display Panel
-        display = QWidget(); display_layout = QVBoxLayout(display)
-        self.plot_canvas = PlotCanvas(self)
-        display_layout.addWidget(self.plot_canvas)
+        # --- Add Analyze Existing Images Button ---
+        self.btn_analyze_existing = QPushButton('Analyze Existing Images')
+        control_layout.addWidget(self.btn_analyze_existing)
+        self.btn_analyze_existing.clicked.connect(self.start_batch_analysis)
 
         splitter.addWidget(control)
-        splitter.addWidget(display)
+        self.plot_canvas = PlotCanvas(self)
+        splitter.addWidget(self.plot_canvas)
         splitter.setSizes([350, 850])
 
-        # Connect selectors
-        self.btn_in.clicked.connect(self.select_input_folder)
-        self.btn_out.clicked.connect(self.select_output_folder)
+        # Initial dummy calibration
+        self.calib = {
+            'maxWid':  1000,
+            'maxLen':  1000,
+            'projmat': np.eye(3),
+            'pixel2mm': 0.1,
+            'screen_to_axis_distance': 100.0,
+            'dE_ds_interp': lambda x: np.interp(x, [0, 100, 200], [0, 1, 0]),
+            'average_distance_covered': 1.0,
+            'energy_interp': lambda x: np.interp(x, [0, 100, 200], [0, 100, 200]),
+            'energy_partition': [0, 100, 200]
+        }
+
+        # Timer for batch processing
+        self.batch_timer = None
+        self.batch_files = []
+        self.batch_index = 0
+        self._batch_workers = []  # Track running batch workers
+
+        self._live_workers = []  # Track running live workers
 
     def create_calibration(self):
         try:
@@ -699,34 +741,17 @@ class MainWindow(QMainWindow):
             except Exception as ex:
                 self.log.append(f"[ERROR] Failed to load calibration: {ex}")
 
-    def select_input_folder(self):
-        path = QFileDialog.getExistingDirectory(self, 'Select Input Folder')
-        if path:
-            self.input_folder = path
-            self.lbl_in.setText(self._elide_path(path, self.lbl_in))
-            self.lbl_in.setToolTip(path)  # Show full path on hover
-            self.restart_observer()
-
-    def select_output_folder(self):
-        path = QFileDialog.getExistingDirectory(self, 'Select Output Folder')
-        if path:
-            self.output_folder = path
-            self.lbl_out.setText(self._elide_path(path, self.lbl_out))
-            self.lbl_out.setToolTip(path)  # Show full path on hover
-            self.restart_observer()
-    def _elide_path(self, path, label):
-        """
-        Truncate the path with ellipsis if it exceeds the label's max width.
-        """
-        metrics = label.fontMetrics()
-        max_width = label.maximumWidth() if label.maximumWidth() > 0 else 180
-        return metrics.elidedText(path, Qt.ElideMiddle, max_width)
-
     def restart_observer(self):
-        if self.observer:
-            self.observer.stop()
-            self.observer.join()
-            self.observer = None
+        # Stop existing observer
+        if hasattr(self, 'observer') and self.observer:
+            try:
+                self.observer.stop()
+                self.observer.join(timeout=1.0)  # Don't wait forever
+            except Exception as ex:
+                print(f"Warning: Error stopping previous observer: {ex}")
+            finally:
+                self.observer = None
+        # Start new observer if all conditions are met
         if self.input_folder and self.output_folder and self.calib:
             try:
                 handler = NewFileHandler(self)
@@ -734,18 +759,152 @@ class MainWindow(QMainWindow):
                 self.observer = PollingObserver()
                 self.observer.schedule(handler, self.input_folder, recursive=False)
                 self.observer.start()
-                self.log.append(f'Watching {self.input_folder}')
+                try:
+                    self.log.append(f'Watching {self.input_folder}')
+                except RuntimeError:
+                    # GUI destroyed while starting observer
+                    if self.observer:
+                        self.observer.stop()
+                        self.observer = None
             except Exception as ex:
-                self.log.append(f"[ERROR] Failed to start observer: {ex}")
+                try:
+                    self.log.append(f"[ERROR] Failed to start observer: {ex}")
+                except RuntimeError:
+                    print(f"[ERROR] Failed to start observer: {ex}")
+
+    def select_input_folder(self):
+        print('[DEBUG] select_input_folder: Button clicked.')
+        self.log.append('[DEBUG] select_input_folder: Button clicked.')
+        try:
+            path = QFileDialog.getExistingDirectory(self, 'Select Input Folder', options=QFileDialog.Option.ShowDirsOnly)
+            print(f'[DEBUG] QFileDialog.getExistingDirectory returned: {path!r}')
+            self.log.append(f'[DEBUG] QFileDialog.getExistingDirectory returned: {path!r}')
+            if path:
+                self.input_folder = path
+                self.lbl_in.setText(self._elide_path(path, self.lbl_in))
+                self.lbl_in.setToolTip(path)  # Show full path on hover
+                print(f'[INFO] Input folder set: {path}')
+                self.log.append(f'[INFO] Input folder set: {path}')
+                self.restart_observer()
+            else:
+                print('[WARN] No folder selected or dialog was cancelled.')
+                self.log.append('[WARN] No folder selected or dialog was cancelled.')
+        except Exception as ex:
+            print(f'[ERROR] Exception in select_input_folder: {ex}')
+            self.log.append(f'[ERROR] Exception in select_input_folder: {ex}')
+
+    def select_output_folder(self):
+        print('[DEBUG] select_output_folder: Button clicked.')
+        self.log.append('[DEBUG] select_output_folder: Button clicked.')
+        try:
+            path = QFileDialog.getExistingDirectory(self, 'Select Output Folder')
+            print(f'[DEBUG] QFileDialog.getExistingDirectory returned: {path!r}')
+            self.log.append(f'[DEBUG] QFileDialog.getExistingDirectory returned: {path!r}')
+            if path:
+                self.output_folder = path
+                self.lbl_out.setText(self._elide_path(path, self.lbl_out))
+                self.lbl_out.setToolTip(path)  # Show full path on hover
+                print(f'[INFO] Output folder set: {path}')
+                self.log.append(f'[INFO] Output folder set: {path}')
+                self.restart_observer()
+            else:
+                print('[WARN] No folder selected or dialog was cancelled.')
+                self.log.append('[WARN] No folder selected or dialog was cancelled.')
+        except Exception as ex:
+            print(f'[ERROR] Exception in select_output_folder: {ex}')
+            self.log.append(f'[ERROR] Exception in select_output_folder: {ex}')
+
+    def _elide_path(self, path, label):
+        """
+        Truncate the path with ellipsis if it exceeds the label's max width.
+        """
+        metrics = label.fontMetrics()
+        max_width = label.maximumWidth() if label.maximumWidth() > 0 else 180
+        return metrics.elidedText(path, Qt.TextElideMode.ElideMiddle, max_width)
 
     def closeEvent(self, event):
-        if self.observer:
-            self.observer.stop()
-            self.observer.join()
-            self.observer = None
+        # Stop the file observer first to prevent new file processing
+        if hasattr(self, 'observer') and self.observer:
+            try:
+                self.observer.stop()
+                self.observer.join(timeout=2.0)  # Wait max 2 seconds
+            except Exception as ex:
+                print(f"Warning: Error stopping observer: {ex}")
+            finally:
+                self.observer = None
+        # Stop all running batch workers
+        for worker in getattr(self, '_batch_workers', []):
+            if worker.isRunning():
+                worker.quit()
+                worker.wait(2000)  # Wait max 2 seconds per worker
+        # Stop all running live workers
+        for worker in getattr(self, '_live_workers', []):
+            if worker.isRunning():
+                worker.quit()
+                worker.wait(2000)  # Wait max 2 seconds per worker
+        # Set a flag to indicate the window is closing
+        self._closing = True
+        # Allow the event to proceed
         super().closeEvent(event)
 
-    # Optional: Validate spin box values before processing
+    def start_batch_analysis(self):
+        if not self.input_folder or not self.calib:
+            self.log.append('[ERROR] Input folder and calibration must be set.')
+            return
+        # Find image files in input folder
+        exts = ('.tif', '.tiff', '.png', '.jpg')
+        files = [os.path.join(self.input_folder, f) for f in os.listdir(self.input_folder)
+                 if f.lower().endswith(exts)]
+        if not files:
+            self.log.append('[INFO] No image files found in input folder.')
+            return
+        self.log.append(f'[INFO] Found {len(files)} image files. Starting batch analysis at 1 Hz...')
+        self.batch_files = files
+        self.batch_index = 0
+        if self.batch_timer:
+            self.batch_timer.stop()
+        self.batch_timer = QTimer(self)
+        self.batch_timer.timeout.connect(self.process_next_batch_image)
+        self.batch_timer.start(1000)  # 1 Hz
+
+    def process_next_batch_image(self):
+        if self.batch_index >= len(self.batch_files):
+            self.log.append('[INFO] Batch analysis complete.')
+            self.batch_timer.stop()
+            return
+        path = self.batch_files[self.batch_index]
+        self.log.append(f'[INFO] Batch analyzing: {os.path.basename(path)}')
+        worker = AnalysisWorker(self, path)
+        worker.result_ready.connect(self.handle_batch_result)
+        worker.error.connect(lambda msg: self.log.append(msg))
+        worker.finished.connect(lambda: self._batch_workers.remove(worker) if worker in self._batch_workers else None)
+        self._batch_workers.append(worker)
+        worker.start()
+        self.batch_index += 1
+
+    def handle_batch_result(self, result):
+        # Update feedback labels for scoring breakdown
+        score_dict = result.get('score_dict', {})
+        self.lbl_score_shape.setText(f"{score_dict.get('shape', 0.0):.2f}")
+        self.lbl_score_peak.setText(f"{score_dict.get('peak', 0.0):.2f}")
+        self.lbl_score_spread.setText(f"{score_dict.get('spread', 0.0):.2f}")
+        self.lbl_score_kurt.setText(f"{score_dict.get('kurtosis', 0.0):.2f}")
+        self.lbl_score_multipeak.setText(f"{score_dict.get('multipeak', 0.0):.2f}")
+        self.lbl_score_lowE.setText(f"{score_dict.get('low', 0.0):.2f}")
+        self.lbl_score_overshoot.setText(f"{score_dict.get('over', 0.0):.2f}")
+        self.lbl_score_totalcost.setText(f"{score_dict.get('raw', 0.0):.2f}")
+        # Log the cost and score
+        self.log.append(f"[INFO] Batch result: Score {score_dict.get('score', 0.0):.2f} (raw cost={score_dict.get('raw', 0.0):.2f})")
+        # Update plots
+        self.plot_canvas.update_plots(
+            post_PT=result.get('postPT'),
+            spec2D=result.get('spec2D'),
+            energy_axis=result.get('e_axis'),
+            masked_energy=result.get('m_e'),
+            masked_intensity=result.get('m_spec'),
+            score_dict=score_dict
+        )
+
     def validate_parameters(self):
         if self.spin_minE.value() >= self.spin_maxE.value():
             self.log.append("[WARN] Min E must be less than Max E.")
@@ -753,11 +912,95 @@ class MainWindow(QMainWindow):
         # Add more checks as needed
         return True
 
+    def handle_new_file(self, path):
+        """
+        Called when a new image file is detected in the input folder.
+        Starts analysis in a worker thread.
+        """
+        self.log.append(f"[INFO] Processing new file: {os.path.basename(path)}")
+        worker = AnalysisWorker(self, path)
+        worker.result_ready.connect(lambda result: self.handle_analysis_result(result, path))
+        worker.error.connect(lambda msg: self.log.append(msg))
+        worker.finished.connect(lambda: self._live_workers.remove(worker) if worker in self._live_workers else None)
+        self._live_workers.append(worker)
+        worker.start()
+
+    def save_analysis_output(self, result, source_path):
+        """
+        Save analysis results to the output folder as CSV.
+        result: dict containing keys 'score_dict', 'm_e', 'm_spec'
+        source_path: original image file path (for naming)
+        """
+        import os
+        score_dict = result.get('score_dict', {})
+        m_e = result.get('m_e', [])
+        m_spec = result.get('m_spec', [])
+        if self.output_folder:
+            base = os.path.splitext(os.path.basename(source_path))[0]
+            out_csv = os.path.join(self.output_folder, f"{base}_results.csv")
+            try:
+                with open(out_csv, "w") as f:
+                    f.write("# Score Summary\n")
+                    for k, v in score_dict.items():
+                        f.write(f"{k},{v}\n")
+                    f.write("# Masked Spectrum (Energy,Intensity)\n")
+                    for e, s in zip(m_e, m_spec):
+                        f.write(f"{e},{s}\n")
+                self.log.append(f"[INFO] Results saved: {out_csv}")
+            except Exception as ex:
+                self.log.append(f"[ERROR] Failed to save results: {ex}")
+        else:
+            self.log.append("[WARN] Output folder not set. Results not saved.")
+
+    def handle_analysis_result(self, result, source_path):
+        # Update feedback labels for scoring breakdown
+        score_dict = result.get('score_dict', {})
+        self.lbl_score_shape.setText(f"{score_dict.get('shape', 0.0):.2f}")
+        self.lbl_score_peak.setText(f"{score_dict.get('peak', 0.0):.2f}")
+        self.lbl_score_spread.setText(f"{score_dict.get('spread', 0.0):.2f}")
+        self.lbl_score_kurt.setText(f"{score_dict.get('kurtosis', 0.0):.2f}")
+        self.lbl_score_multipeak.setText(f"{score_dict.get('multipeak', 0.0):.2f}")
+        self.lbl_score_lowE.setText(f"{score_dict.get('low', 0.0):.2f}")
+        self.lbl_score_overshoot.setText(f"{score_dict.get('over', 0.0):.2f}")
+        self.lbl_score_totalcost.setText(f"{score_dict.get('raw', 0.0):.2f}")
+        self.log.append(f"[INFO] Analysis result: Score {score_dict.get('score', 0.0):.2f} (raw cost={score_dict.get('raw', 0.0):.2f})")
+        self.plot_canvas.update_plots(
+            post_PT=result.get('postPT'),
+            spec2D=result.get('spec2D'),
+            energy_axis=result.get('e_axis'),
+            masked_energy=result.get('m_e'),
+            masked_intensity=result.get('m_spec'),
+            score_dict=score_dict
+        )
+        self.save_analysis_output(result, source_path)
+
+    def process_next_batch_image(self):
+        if self.batch_index >= len(self.batch_files):
+            self.log.append('[INFO] Batch analysis complete.')
+            self.batch_timer.stop()
+            return
+        path = self.batch_files[self.batch_index]
+        self.log.append(f'[INFO] Batch analyzing: {os.path.basename(path)}')
+        worker = AnalysisWorker(self, path)
+        worker.result_ready.connect(lambda result: self.handle_analysis_result(result, path))
+        worker.error.connect(lambda msg: self.log.append(msg))
+        worker.finished.connect(lambda: self._batch_workers.remove(worker) if worker in self._batch_workers else None)
+        self._batch_workers.append(worker)
+        worker.start()
+        self.batch_index += 1
+
+
 if __name__ == '__main__':
     try:
+        print('[DEBUG] Starting QApplication...')
         app = QApplication(sys.argv)
+        print('[DEBUG] QApplication started.')
         w = MainWindow()
+        print('[DEBUG] MainWindow created.')
         w.show()
+        print('[DEBUG] MainWindow shown.')
         sys.exit(app.exec())
     except Exception as ex:
+        import traceback
         print(f"[FATAL] Application crashed: {ex}")
+        print(traceback.format_exc())

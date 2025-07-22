@@ -3,6 +3,12 @@
 # Includes threading, efficient plotting, file-watcher placeholders,
 # error handling, persistent logging, mode switching, and full integration.
 
+import sys
+import xopt
+print("Python executable:", sys.executable)
+print("xopt location:", xopt.__file__)
+print("xopt version:", xopt.__version__)
+
 import sys              # System-specific parameters and functions
 import os               # Miscellaneous operating system interfaces
 import glob             # Unix style pathname pattern expansion
@@ -10,7 +16,7 @@ import time             # Time access and conversions
 import csv              # CSV file reading and writing
 from threading import Thread, Event
 
-from bo_engine import compute_objective, create_xopt  # Custom Bayesian Optimization engine
+from bo_engine import create_xopt  # Custom Bayesian Optimization engine
 
 from PyQt5.QtWidgets import (
     QApplication,       # Core application object
@@ -74,7 +80,7 @@ class OptimizationWorker(Thread):
         if not os.path.exists(self.log_file):
             with open(self.log_file, 'w', newline='') as f:
                 writer = csv.writer(f)
-                writer.writerow(['shot','params','overall','spec','charge','timestamp'])
+                writer.writerow(['shot','params','spec','charge','stability','timestamp'])
 
         # Initialize Xopt optimizer with active knobs and evaluation function
         mode   = self.gui.get_acquisition_mode()
@@ -120,9 +126,8 @@ class OptimizationWorker(Thread):
             if metrics is None:
                 metrics = {'overall': None, 'spec': None, 'charge': None}
 
-            # Calculate the scalar objective from diagnostics
-            score = compute_objective(metrics)
-            metrics['overall'] = score
+            # Build multi-objective result for Xopt
+            # (spectra_score, charge, stability are returned by collect_metrics)
 
             # Send the metrics to the GUI for real-time plotting
             self.signals.new_metrics.emit(metrics)
@@ -134,29 +139,31 @@ class OptimizationWorker(Thread):
                     writer.writerow([
                         shot,
                         str(params),
-                        metrics['overall'],
-                        metrics['spec'],
-                        metrics['charge'],
+                        metrics.get('spec'),
+                        metrics.get('charge'),
+                        metrics.get('stability'),
                         time.time()
                     ])
             except Exception as e:
                 print(f"Error writing to log file: {e}")
 
-            # Store the evaluated result into the Xopt history
-            self.X.add_data(params | {'score': score})
+            # Store the evaluated result into the Xopt history (three objectives)
+            self.X.add_data({**params,
+                             'spectra_score': metrics.get('spec'),
+                             'charge':       metrics.get('charge'),
+                             'stability':    metrics.get('stability')})
 
         # Signal that we’ve fully stopped
         self.signals.finished.emit()
 
     def evaluate(self, inputs_list):
         """
-        Receives suggestions from Xopt, pushes them through GUI + measurement + scoring,
-        and returns the computed score. Called internally by Xopt.
+        Receives suggestions from Xopt, pushes them through GUI + measurement,
+        and returns a list of dicts with multi-objective metrics.
         """
         results = []
         for params in inputs_list:
             self.param_event.clear()
-            # self.gui.request_param_confirmation(params)
             self.signals.param_request.emit(params)
             while not self.param_event.is_set() and not self.stop_event.is_set():
                 time.sleep(0.05)
@@ -164,10 +171,14 @@ class OptimizationWorker(Thread):
                 break
             try:
                 metrics = self.collect_metrics(timeout=5)
-            except Exception as e:
-                metrics = {'overall': None, 'spec': None, 'charge': None}
-            score = compute_objective(metrics)
-            results.append({'score': score})
+            except Exception:
+                metrics = {'spec': None, 'charge': None, 'stability': None}
+            # Map collected metrics to Xopt objectives
+            results.append({
+                'spectra_score': metrics.get('spec'),
+                'charge':       metrics.get('charge'),
+                'stability':    metrics.get('stability')
+            })
         return results
 
     def on_param_confirmed(self, params):
@@ -177,38 +188,74 @@ class OptimizationWorker(Thread):
     def collect_metrics(self, timeout=5):
         """
         Look in the measurement folders for your latest E-Spec or Profile & ICT data.
-        - In E-Spec mode: read score,cost,counts from espectra .txt files.
+        - In E-Spec mode: read score,cost,counts from espectra .txt files or score/charge from CSV files.
         - In Profile & ICT mode: fallback to spec from profile_dir and charge from ict_dir.
         Returns a dict when both spec & charge are ready, or None after timeout.
-        Computes stability (coefficient of variation) over last N shots for the current parameter set.
+        Computes mean and std over last N shots for the current parameter set.
         """
+        import numpy as np
+        import pandas as pd
         start = time.time()
         while time.time() - start < timeout:
             mode = self.gui.get_mode()  # "E-Spec" or "Profile & ICT"
-            overall = 1.0  # placeholder, overwritten by compute_objective()
+            overall = None  # will be set below
 
             spec = None
             charge = None
+            spec_std = None
+            charge_std = None
 
             N = self.gui.shots_spin.value()
 
             if mode == 'E-Spec':
-                # ----- E-Spec branch -----
                 path = self.gui.espec_dir
-                files = sorted(glob.glob(os.path.join(path, '*.txt')))
-                if len(files) >= N:
-                    scores, counts = [], []
-                    for fn in files[-N:]:
-                        try:
+                # Gather latest N output files (.txt and .csv)
+                txt_files = sorted(glob.glob(os.path.join(path, '*.txt')))
+                csv_files = sorted(glob.glob(os.path.join(path, '*.csv')))
+                # Use only the latest N files (prefer txt, then csv)
+                all_files = txt_files + csv_files
+                all_files = sorted(all_files)[-N:]
+                # Print notification if new files are detected
+                if hasattr(self, '_last_seen_files'):
+                    new_files = set(all_files) - set(self._last_seen_files)
+                    if new_files:
+                        for fn in new_files:
+                            # Print last 3 subfolder addresses
+                            parts = os.path.normpath(fn).split(os.sep)
+                            subpath = os.sep.join(parts[-4:]) if len(parts) >= 4 else fn
+                            print(f"[File Detected] New E-Spec file: .../{subpath}")
+                self._last_seen_files = list(all_files)
+                scores, charges = [], []
+                for fn in all_files:
+                    try:
+                        if fn.endswith('.txt'):
                             line = open(fn, 'r').readline().strip()
                             sc, cost, ct = map(float, line.split(','))  # score,cost,counts
                             scores.append(sc)
-                            counts.append(ct)
-                        except Exception as e:
-                            print(f"Error parsing E-Spec file {fn}: {e}")
-                    if scores:
-                        spec   = sum(scores) / len(scores)
-                        charge = sum(counts) / len(counts)
+                            charges.append(ct)
+                        elif fn.endswith('.csv'):
+                            df = pd.read_csv(fn)
+                            # Try to find columns for score and charge
+                            score_col = None
+                            charge_col = None
+                            for col in df.columns:
+                                if 'score' in col.lower():
+                                    score_col = col
+                                if 'charge' in col.lower() or 'counts' in col.lower():
+                                    charge_col = col
+                            if score_col is None or charge_col is None:
+                                score_col = df.columns[0]
+                                charge_col = df.columns[1]
+                            # Use last row in CSV as the latest shot
+                            scores.append(df[score_col].values[-1])
+                            charges.append(df[charge_col].values[-1])
+                    except Exception as e:
+                        print(f"Error parsing E-Spec file {fn}: {e}")
+                if scores and charges:
+                    spec = float(np.mean(scores))
+                    charge = float(np.mean(charges))
+                    spec_std = float(np.std(scores))
+                    charge_std = float(np.std(charges))
             else:
                 # ----- Profile & ICT branch (unchanged) -----
                 # spec from profile_dir
@@ -217,7 +264,8 @@ class OptimizationWorker(Thread):
                 if len(prof_files) >= N:
                     try:
                         vals = [float(open(f).readline()) for f in prof_files[-N:]]
-                        spec = sum(vals) / len(vals)
+                        spec = float(np.mean(vals))
+                        spec_std = float(np.std(vals))
                     except Exception as e:
                         print(f"Error reading profile spec files: {e}")
 
@@ -227,14 +275,13 @@ class OptimizationWorker(Thread):
                 if len(ict_files) >= N:
                     try:
                         vals = [float(open(f).readline()) for f in ict_files[-N:]]
-                        charge = sum(vals) / len(vals)
+                        charge = float(np.mean(vals))
+                        charge_std = float(np.std(vals))
                     except Exception as e:
                         print(f"Error reading ICT charge files: {e}")
 
             # Once we have both metrics, compute stability and return them
             if spec is not None and charge is not None:
-                # --- Compute stability (coefficient of variation of spec over last N shots for this param set) ---
-                # Use a rolling window per parameter set
                 params = tuple(sorted(self.gui.confirmed_params.items())) if self.gui.confirmed_params else None
                 if not hasattr(self, '_pareto_param_history_worker'):
                     self._pareto_param_history_worker = {}
@@ -243,14 +290,18 @@ class OptimizationWorker(Thread):
                     entry.append((spec, charge))
                     if len(entry) > N:
                         entry[:] = entry[-N:]
-                    import numpy as np
                     arr = np.array(entry)
                     mean_spec = float(np.mean(arr[:,0]))
-                    # Stability: coefficient of variation (std/mean) of spec
                     stability = float(np.std(arr[:,0]) / mean_spec) if mean_spec != 0 else 0.0
                 else:
                     stability = 0.0
-                return {'overall': overall, 'spec': spec, 'charge': charge, 'stability': stability}
+                # Compute geometric mean for 'overall' metric
+                if spec > 0 and charge > 0:
+                    overall = float(np.sqrt(spec * charge))
+                else:
+                    overall = 0.0
+                # Return mean and std for plotting error bars
+                return {'overall': overall, 'spec': spec, 'charge': charge, 'spec_std': spec_std, 'charge_std': charge_std, 'stability': stability}
 
             time.sleep(0.1)
 
@@ -372,8 +423,8 @@ class LPAControlGUI(QMainWindow):
         self.start_btn = QPushButton("Start Optimization")
         self.pause_btn = QPushButton("Pause")
         self.restart_btn = QPushButton("Restart")
-        # Determine the minimum width needed for the largest button text
-        btns = [self.copy_btn, self.confirm_btn, self.start_btn, self.pause_btn, self.restart_btn]
+        self.show_params_btn = QPushButton("Show Current Parameters")
+        btns = [self.copy_btn, self.confirm_btn, self.start_btn, self.pause_btn, self.restart_btn, self.show_params_btn]
         max_width = max(btn.sizeHint().width() for btn in btns)
         for btn in btns:
             btn.setFixedWidth(max_width)
@@ -382,7 +433,6 @@ class LPAControlGUI(QMainWindow):
         self.confirm_btn.clicked.connect(self.confirm_parameters)
         self.confirm_btn.setEnabled(False)
         btn_col.addWidget(self.confirm_btn, alignment=Qt.AlignLeft)
-        # self.start_btn.clicked.connect(self.start_optimization)
         self.start_btn.clicked.connect(self.start_optimization)
         self.start_btn.setEnabled(False)   # disabled until dirs are set
         btn_col.addWidget(self.start_btn, alignment=Qt.AlignLeft)
@@ -391,6 +441,8 @@ class LPAControlGUI(QMainWindow):
         btn_col.addWidget(self.pause_btn, alignment=Qt.AlignLeft)
         self.restart_btn.clicked.connect(self.restart_optimization)
         btn_col.addWidget(self.restart_btn, alignment=Qt.AlignLeft)
+        self.show_params_btn.clicked.connect(self.show_current_parameters)
+        btn_col.addWidget(self.show_params_btn, alignment=Qt.AlignLeft)
         btn_col.addStretch(1)
         main_hbox.addLayout(btn_col)
 
@@ -428,14 +480,16 @@ class LPAControlGUI(QMainWindow):
         l.addLayout(manual_layout)
         self.manual_checkbox.toggled.connect(self._on_manual_toggled)
 
-        sl = QHBoxLayout()
-        sl.addWidget(QLabel("Shots to average:"))
+        # Move 'Shots to average' to the lowest row of the first column
+        shots_hbox = QHBoxLayout()
+        shots_hbox.addWidget(QLabel("Shots to average:"), alignment=Qt.AlignLeft)
         self.shots_spin = QSpinBox()
         self.shots_spin.setMinimum(1)
         self.shots_spin.setValue(10)
-        sl.addWidget(self.shots_spin)
-        sl.addStretch(1)
-        l.addLayout(sl)
+        shots_hbox.addWidget(self.shots_spin, alignment=Qt.AlignLeft)
+        shots_hbox.addStretch(1)
+        left_col.addSpacing(10)
+        left_col.addLayout(shots_hbox)
 
         # --- Plots: overall, spec, charge in a vertical column, Pareto plot to the right ---
         plot_hbox = QHBoxLayout()
@@ -583,7 +637,7 @@ class LPAControlGUI(QMainWindow):
 
     def get_active_params(self):
         """Return list of parameter names you’ve checked as active."""
-        return [n for n, cb in self.param_checks.items() if cb.isChecked()]
+        return [n for n, cb in self.param_checks.items() if cb.isChecked()] 
 
     def _on_manual_toggled(self, checked: bool):
         """Show or hide the explore/exploit slider when manual mode is toggled."""
@@ -849,6 +903,139 @@ class LPAControlGUI(QMainWindow):
             msg = f"Pareto point:\nSpec: {specs[idx]:.3g}, Charge: {charges[idx]:.3g}\nStability: {self.pareto_data[idx]['stability']:.3g}\nParams: {params}"
             from PyQt5.QtWidgets import QMessageBox
             QMessageBox.information(self, "Pareto Point Details", msg)
+
+    def show_current_parameters(self):
+        """
+        Scan the watched folders for the latest output files and display averaged metrics
+        (spec, charge, stability, overall) for the last N shots in the activity log.
+        Also plot these metrics on the three plots.
+        """
+        import numpy as np
+        N = self.shots_spin.value()
+        mode = self.get_mode()
+        scores, charges = [], []
+        if mode == 'E-Spec' and hasattr(self, 'espec_dir'):
+            path = self.espec_dir
+            txt_files = sorted(glob.glob(os.path.join(path, '*.txt')))
+            csv_files = sorted(glob.glob(os.path.join(path, '*.csv')))
+            all_files = txt_files + csv_files
+            all_files = sorted(all_files)
+            for fn in all_files:
+                try:
+                    if fn.endswith('.txt'):
+                        line = open(fn, 'r').readline().strip()
+                        sc, cost, ct = map(float, line.split(','))
+                        scores.append(sc)
+                        charges.append(ct)
+                    elif fn.endswith('.csv'):
+                        score_val = None
+                        charge_val = None
+                        with open(fn, 'r') as f:
+                            for line in f:
+                                line = line.strip()
+                                if not line or line.startswith('#'):
+                                    continue
+                                parts = line.split(',')
+                                if len(parts) != 2:
+                                    continue
+                                key, value = parts[0].strip().lower(), parts[1].strip()
+                                if key == 'score':
+                                    try:
+                                        score_val = float(value)
+                                    except Exception:
+                                        pass
+                                elif key == 'raw':
+                                    try:
+                                        charge_val = float(value)
+                                    except Exception:
+                                        pass
+                        if score_val is not None:
+                            scores.append(score_val)
+                        if charge_val is not None:
+                            charges.append(charge_val)
+                except Exception:
+                    pass
+        elif mode == 'Profile & ICT' and hasattr(self, 'profile_dir') and hasattr(self, 'ict_dir'):
+            prof_files = sorted(glob.glob(os.path.join(self.profile_dir, '*.txt')))
+            ict_files = sorted(glob.glob(os.path.join(self.ict_dir, '*.txt')))
+            try:
+                scores = [float(open(f).readline()) for f in prof_files]
+            except Exception:
+                scores = []
+            try:
+                charges = [float(open(f).readline()) for f in ict_files]
+            except Exception:
+                charges = []
+        # Grouped averaging and plotting
+        def grouped_average(arr, window):
+            arr = np.array(arr)
+            n_groups = len(arr) // window
+            if n_groups == 0:
+                return [], []
+            means = [float(np.mean(arr[i*window:(i+1)*window])) for i in range(n_groups)]
+            stds = [float(np.std(arr[i*window:(i+1)*window])) for i in range(n_groups)]
+            return means, stds
+        if scores and charges:
+            avg_scores, std_scores = grouped_average(scores, N)
+            avg_charges, std_charges = grouped_average(charges, N)
+            avg_overall = [float(np.sqrt(s * c)) if s > 0 and c > 0 else 0.0 for s, c in zip(avg_scores, avg_charges)]
+            shots = list(range(len(avg_scores)))
+            self.plot_spec.clear()
+            self.plot_spec.plot(shots, avg_scores, pen='b', symbol='o')
+            self.plot_charge.clear()
+            self.plot_charge.plot(shots, avg_charges, pen='r', symbol='o')
+            self.plot_overall.clear()
+            self.plot_overall.plot(shots, avg_overall, pen='g', symbol='o')
+
+    def load_espec_results_csv(self, file_path=None):
+        """Load E-Spec results from CSV, average over last N rows, and plot diagnostic score and charge."""
+        import pandas as pd
+        import os
+        if file_path is None:
+            # Try to find the file in espec_dir
+            if hasattr(self, 'espec_dir'):
+                # Look for a file ending with .csv
+                files = [f for f in os.listdir(self.espec_dir) if f.endswith('.csv')]
+                if files:
+                    file_path = os.path.join(self.espec_dir, files[0])
+                else:
+                    self.log_activity("No CSV file found in E-Spec directory.")
+                    return
+            else:
+                self.log_activity("E-Spec directory not set.")
+                return
+        try:
+            df = pd.read_csv(file_path)
+            # Try to find columns for score and charge
+            score_col = None
+            charge_col = None
+            for col in df.columns:
+                if 'score' in col.lower():
+                    score_col = col
+                if 'charge' in col.lower() or 'counts' in col.lower():
+                    charge_col = col
+            if score_col is None or charge_col is None:
+                # Fallback: use first and second columns
+                score_col = df.columns[0]
+                charge_col = df.columns[1]
+            N = self.shots_spin.value()
+            scores = df[score_col].values[-N:]
+            charges = df[charge_col].values[-N:]
+            shots = range(len(df) - N + 1, len(df) + 1)
+            # Plot Diagnostic Score
+            self.plot_spec.clear()
+            self.plot_spec.plot(list(shots), list(scores), pen='b', symbol='o')
+            # Plot Charge Metric
+            self.plot_charge.clear()
+            self.plot_charge.plot(list(shots), list(charges), pen='r', symbol='o')
+            # Log average values
+            avg_score = sum(scores) / len(scores) if len(scores) > 0 else 0
+            avg_charge = sum(charges) / len(charges) if len(charges) > 0 else 0
+            self.log_activity(f"Loaded {N} E-Spec results from {os.path.basename(file_path)}. Avg score: {avg_score:.3f}, Avg charge: {avg_charge:.3f}")
+        except Exception as e:
+            from PyQt5.QtWidgets import QMessageBox
+            QMessageBox.warning(self, "E-Spec Load Error", str(e))
+            self.log_activity(f"Error loading E-Spec CSV: {e}")
 
 if __name__=='__main__':
     app = QApplication(sys.argv)
