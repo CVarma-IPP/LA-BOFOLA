@@ -125,11 +125,13 @@ def process_image_v2(img: np.ndarray, calib: dict, ROI_selection_percent: float 
     screen_mm = np.linspace(
         calib['screen_to_axis_distance'],
         calib['screen_to_axis_distance'] + w * calib['pixel2mm'],
-        w    )
+        w
+    )
 
-    # print(f"Screen distance axis (mm): max={max(screen_mm)}, min={min(screen_mm)}")
+    print(f"Screen distance axis (mm): max={max(screen_mm)}, min={min(screen_mm)}")
     # mm → energy
     energy_axis = calib['energy_interp'](screen_mm)
+    print(f"Energy axis (MeV): max={max(energy_axis)}, min={min(energy_axis)}")
 
     # background subtraction & divergence
     post_bg, divergence_vals, energy_sections = acf.cuts_and_BG(
@@ -256,16 +258,44 @@ class PlotCanvas(FigureCanvas):
             im = self.ax_img.imshow(
                 post_PT, aspect='auto', origin='lower', cmap=cmap
             )
-            # X-axis: columns → mm
+            # X-axis: columns → mm (use actual screen_mm values)
             w = post_PT.shape[1]
-            xt = np.linspace(0, w, 6)
-            self.ax_img.set_xticks(xt)
-            self.ax_img.set_xticklabels((xt * pixel2mm).astype(int))
+            
+            # Calculate screen_mm axis
+            if hasattr(self, 'parent') and hasattr(self.parent(), 'calib'):
+                calib = self.parent().calib
+            else:
+                calib = None
+            if calib is not None:
+                # Use the same formula as in process_image_v2, but ensure axis is in mm (not pixels)
+                screen_mm = np.linspace(
+                    calib['screen_to_axis_distance'],
+                    calib['screen_to_axis_distance'] + w * calib['pixel2mm'],
+                    w
+                )
+                print('[DEBUG] Using calib for axis ticks. pixel2mm:', calib['pixel2mm'])
+                xt_idx = np.linspace(0, w-1, 6).astype(int)
+                xticks = xt_idx
+                xticklabels = [f"{screen_mm[i]:.1f}" for i in xt_idx]
+                self.ax_img.set_xticks(xticks)
+                self.ax_img.set_xticklabels(xticklabels)
+            else:
+                print('[DEBUG] Using fallback (pixels) for axis ticks.')
+                xt = np.linspace(0, w, 6)
+                self.ax_img.set_xticks(xt)
+                self.ax_img.set_xticklabels((xt * pixel2mm).astype(int))
             # Y-axis: rows → mm
             h = post_PT.shape[0]
-            yt = np.linspace(0, h, 6)
-            self.ax_img.set_yticks(yt)
-            self.ax_img.set_yticklabels((yt * pixel2mm).astype(int))
+            yt = np.linspace(0, h-1, 6).astype(int)
+            yticks = yt
+            if calib is not None:
+                screen_mm_y = yt * calib['pixel2mm']
+                yticklabels = [f"{val:.1f}" for val in screen_mm_y]
+                self.ax_img.set_yticks(yticks)
+                self.ax_img.set_yticklabels(yticklabels)
+            else:
+                self.ax_img.set_yticks(yt)
+                self.ax_img.set_yticklabels((yt * pixel2mm).astype(int))
             self.ax_img.set_xlabel('Screen Distance (mm)')
             self.ax_img.set_ylabel('Screen Position (mm)')
             cb1 = self.ax_img.figure.colorbar(
@@ -724,7 +754,7 @@ class MainWindow(QMainWindow):
         self._batch_workers = []  # Track running batch workers
 
         self._live_workers = []  # Track running live workers
-
+    
     def create_calibration(self):
         try:
             cc.save_calibration_data()
@@ -902,7 +932,8 @@ class MainWindow(QMainWindow):
             energy_axis=result.get('e_axis'),
             masked_energy=result.get('m_e'),
             masked_intensity=result.get('m_spec'),
-            score_dict=score_dict
+            score_dict=score_dict,
+            pixel2mm=self.calib['pixel2mm'],
         )
 
     def validate_parameters(self):
@@ -935,6 +966,8 @@ class MainWindow(QMainWindow):
         score_dict = result.get('score_dict', {})
         m_e = result.get('m_e', [])
         m_spec = result.get('m_spec', [])
+        # Calculate total counts in masked spectrum
+        total_counts = np.sum(m_spec) if len(m_spec) > 0 else 0
         if self.output_folder:
             base = os.path.splitext(os.path.basename(source_path))[0]
             out_csv = os.path.join(self.output_folder, f"{base}_results.csv")
@@ -943,6 +976,8 @@ class MainWindow(QMainWindow):
                     f.write("# Score Summary\n")
                     for k, v in score_dict.items():
                         f.write(f"{k},{v}\n")
+                    # Add total counts line
+                    f.write(f"# Total Counts in Masked Spectrum: {total_counts}\n")
                     f.write("# Masked Spectrum (Energy,Intensity)\n")
                     for e, s in zip(m_e, m_spec):
                         f.write(f"{e},{s}\n")
@@ -970,7 +1005,8 @@ class MainWindow(QMainWindow):
             energy_axis=result.get('e_axis'),
             masked_energy=result.get('m_e'),
             masked_intensity=result.get('m_spec'),
-            score_dict=score_dict
+            score_dict=score_dict,
+            pixel2mm=self.calib['pixel2mm'],
         )
         self.save_analysis_output(result, source_path)
 
