@@ -5,11 +5,11 @@ from xopt import Xopt
 from xopt.vocs import VOCS
 
 
-def compute_objective(metrics):
-    """
-    Deprecated: Now using true multi-objective. This remains as reference if needed.
-    """
-    return 0.0
+# def compute_objective(metrics):
+#     """
+#     Deprecated: Now using true multi-objective. This remains as reference if needed.
+#     """
+#     return 0.0
 
 
 def create_xopt(active_params, evaluator, bounds, resume_file=None, acquisition_mode=None):
@@ -78,11 +78,16 @@ def create_xopt(active_params, evaluator, bounds, resume_file=None, acquisition_
         if afunc == "qUCB":
             gen_opts["generator_options"] = {"beta": 2.0}
 
+        # Correct configuration here:
         xopt_config["generator"] = {
-            "name":                "botorch",
-            "model":               "standard",
-            "acquisition_function": afunc,
-            **gen_opts
+            "name": "mobo",
+            "model": {"type": "standard"},
+            "acq": {"type": afunc, **gen_opts},
+            "reference_point": {
+                "spectra_score": 0.0,
+                "charge": 0.0,
+                "stability": 0.0
+            }
         }
 
     # Wrap the evaluator to warn if any required objectives are missing from the results
