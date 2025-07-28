@@ -42,6 +42,8 @@ def create_xopt(active_params, evaluator, bounds, resume_file=None, acquisition_
         if not (isinstance(b, (list, tuple)) and len(b) == 2):
             raise ValueError(f"Bounds for '{p}' must be a list or tuple of length 2.")
 
+    print(f"Creating Xopt with {len(active_params)} active parameters: {active_params}")
+
     # 2) Build VOCS
     vocs = VOCS(
         variables={p: bounds[p] for p in active_params},
@@ -52,19 +54,39 @@ def create_xopt(active_params, evaluator, bounds, resume_file=None, acquisition_
         }
     )
 
+    print(f"VOCS created with variables: {vocs.variables}")
+
     # 3) Choose generator based on acquisition_mode
+    """
+    Selects and configures the Bayesian optimization generator based on acquisition_mode.
+    Modes:
+      - 'explore': Prioritizes exploration using BayesianExplorationGenerator.
+      - 'exploit': Scalarizes objectives and uses ExpectedImprovementGenerator for exploitation.
+      - 'balanced' or default: Uses MOBOGenerator for multi-objective optimization.
+    """
     if acquisition_mode == "explore":
+        """
+        Exploration mode: Uses BayesianExplorationGenerator to prioritize sampling unexplored regions.
+        """
         from xopt.generators.bayesian import BayesianExplorationGenerator
         gen = BayesianExplorationGenerator(vocs=vocs)
+        print("Using BayesianExplorationGenerator for exploration mode.")
 
     elif acquisition_mode == "exploit":
-        # scalarize into a single 'overall' objective using geometric mean
+        """
+        Exploitation mode: Scalarizes objectives into a single 'overall' score using geometric mean,
+        then uses ExpectedImprovementGenerator to focus on maximizing this scalarized objective.
+        """
         scalar_vocs = VOCS(
             variables=vocs.variables,
             objectives={"overall": "MAXIMIZE"},
         )
 
         def scalar_eval(param_list):
+            """
+            Scalarizes multi-objective results into a single 'overall' score using the geometric mean.
+            Returns a list of dicts with the 'overall' key for each parameter set.
+            """
             mos = evaluator(param_list)
             out = []
             for m in mos:
@@ -81,8 +103,13 @@ def create_xopt(active_params, evaluator, bounds, resume_file=None, acquisition_
             vocs=scalar_vocs,
             evaluator=scalar_eval
         )
+        print("Using ExpectedImprovementGenerator for exploitation mode.")
 
     else:  # balanced or default
+        """
+        Balanced mode (default): Uses MOBOGenerator for true multi-objective optimization.
+        The reference point is set to zero for all objectives.
+        """
         from xopt.generators.bayesian import MOBOGenerator
         gen = MOBOGenerator(
             vocs=vocs,
@@ -92,17 +119,31 @@ def create_xopt(active_params, evaluator, bounds, resume_file=None, acquisition_
                 "stability":     0.0
             }
         )
+        print("Using MOBOGenerator for balanced mode.")
 
     # 4) Wrap the user-supplied evaluator to check for missing keys
     def wrapped_evaluator(param_list):
+        """
+        Checks the output of the user-supplied evaluator for missing required keys.
+        Raises ValueError if any of 'spectra_score', 'charge', or 'stability' are missing.
+        Also checks that the output is a list of dicts.
+        Returns the original results if valid.
+        """
         results = evaluator(param_list)
-        for res in results:
+        if not isinstance(results, list):
+            raise TypeError("Evaluator must return a list of dicts.")
+        for i, res in enumerate(results):
+            if not isinstance(res, dict):
+                raise TypeError(f"Evaluator result at index {i} is not a dict.")
             for key in ("spectra_score", "charge", "stability"):
                 if key not in res:
-                    print(f"Warning: evaluator result missing '{key}'")
+                    raise ValueError(f"Evaluator result at index {i} missing required key '{key}'.")
         return results
 
     # 5) Build or resume the Xopt instance
+    """
+    Returns a new Xopt instance, or resumes from file if resume_file is provided.
+    """
     if resume_file:
         return Xopt.from_file(resume_file)
     else:
