@@ -13,7 +13,8 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import Qt  # For alignment and orientation flags
 
 # Watch a folder for new files
-from watchdog.observers import Observer
+#from watchdog.observers import Observer
+from watchdog.observers.polling import PollingObserver
 from watchdog.events import FileSystemEventHandler
 
 # Your analysis routine for each new ICT data file
@@ -101,8 +102,9 @@ class NewFileHandler(FileSystemEventHandler):
             return
 
         # Start analysis in a separate thread for responsiveness
-        from threading import Thread
-        Thread(target=self._analyze_file_thread, args=(path,)).start()
+        #from threading import Thread
+        #Thread(target=self._analyze_file_thread, args=(path,)).start()
+        self._analyze_file_thread(path)
 
     def _analyze_file_thread(self, path):
         import shutil
@@ -330,7 +332,8 @@ class MainWindow(QMainWindow):
                 # param_getter returns the two spinbox values
                 param_getter=lambda: (self.spin_val1.value(), self.spin_val2.value())
             )
-            self.observer = Observer()
+            #self.observer = Observer()
+            self.observer = PollingObserver()
             self.observer.schedule(handler, self.in_dir, recursive=False)
             self.observer.start()
             self.log.append(f"▶ Watching {self.in_dir}\n  saving analyses to {self.out_dir}")

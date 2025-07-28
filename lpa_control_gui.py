@@ -193,6 +193,7 @@ class OptimizationWorker(QThread):
         print(f"[evaluate] Final inputs_list type: {type(inputs_list)}, length: {len(inputs_list) if hasattr(inputs_list, 'len') else 'N/A'}")
         for idx, params in enumerate(inputs_list):
             print(f"[evaluate] Processing input {idx}: type={type(params)}, value={params}")
+
             if not isinstance(params, dict):
                 import ast # Safely convert string to dict
                 try:
@@ -204,6 +205,7 @@ class OptimizationWorker(QThread):
 
             self.param_event.clear()
             self.signals.param_request.emit(params)
+
             print(f"[evaluate] Waiting for user to confirm parameters: {params}")
             while not self.param_event.is_set() and not self.stop_event.is_set():
                 time.sleep(0.05)
@@ -215,6 +217,7 @@ class OptimizationWorker(QThread):
             except Exception as e:
                 print(f"[evaluate] Exception in collect_metrics: {e}")
                 metrics = {'spec': None, 'charge': None, 'stability': None}
+
             print(f"[evaluate] metrics after collect_metrics: type={type(metrics)}, value={metrics}")
             # Convert pandas Series or DataFrame to dict if needed
             if metrics is None:

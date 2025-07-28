@@ -135,7 +135,7 @@ def analyze_file(filepath: str, show_plot: bool = False) -> float:
         Total integrated charge in picoCoulombs.
     """
     # Load data assuming two columns, header row optional
-    data = np.loadtxt(filepath, delimiter=',', skiprows=1)
+    data = np.loadtxt(filepath, delimiter=',', skiprows=2)
     time_v = data[:, 0]
     V_v = data[:, 1]
     return analyse_vec(time_v, V_v, show_plot)
