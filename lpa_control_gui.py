@@ -35,7 +35,7 @@ from PyQt5.QtWidgets import (
     QSlider,            # Slider widget for manual control
     QGridLayout,        # Grid layout manager for complex arrangements
 )
-from PyQt5.QtCore import Qt, pyqtSignal, QObject, QSettings  # Added QSettings
+from PyQt5.QtCore import Qt, pyqtSignal, QObject, QSettings, QThread # Added QSettings
 import pyqtgraph as pg  # High-performance plotting library for PyQt
 from PyQt5.QtGui import QFont
 from PyQt5.QtGui import QFontDatabase  # Font database for custom fonts
@@ -58,7 +58,7 @@ class WorkerSignals(QObject):
     param_request   = pyqtSignal(dict)   # request GUI to confirm
     param_confirmed = pyqtSignal(dict)
 
-class OptimizationWorker(Thread):
+class OptimizationWorker(QThread):
     """
     Runs in the background to:
      1. Propose new control-knob settings using Xopt
@@ -94,6 +94,10 @@ class OptimizationWorker(Thread):
 
     def run(self):
         shot = 0
+
+        # Ensure initial data is available for Xopt
+        if getattr(self.X, "data", None) is None or len(self.X.data) == 0:
+            self.X.random_evaluate()
 
         # Main loop: keep going until user stops
         while not self.stop_event.is_set():
@@ -163,8 +167,17 @@ class OptimizationWorker(Thread):
         """
         results = []
         for params in inputs_list:
+            if not isinstance(params, dict):
+                import ast # Safely convert string to dict
+                try:
+                    params = ast.literal_eval(params)
+                    print(f"Converted parameters: {params}")
+                except Exception:
+                    continue  # skip if cannot convert
+
             self.param_event.clear()
             self.signals.param_request.emit(params)
+            print(f"Waiting for user to confirm parameters: {params}")
             while not self.param_event.is_set() and not self.stop_event.is_set():
                 time.sleep(0.05)
             if self.stop_event.is_set():
@@ -173,7 +186,15 @@ class OptimizationWorker(Thread):
                 metrics = self.collect_metrics(timeout=5)
             except Exception:
                 metrics = {'spec': None, 'charge': None, 'stability': None}
-            # Map collected metrics to Xopt objectives
+            print("metrics after collect_metrics:", metrics)  # Debug print
+            if metrics is None or not isinstance(metrics, dict):
+                print("Skipping non-dict metrics:", metrics)
+                continue
+            if hasattr(metrics, "to_dict"):
+                metrics = metrics.to_dict()
+            if not isinstance(metrics, dict):
+                print("Warning: metrics is not a dict, skipping this result.")
+                continue
             results.append({
                 'spectra_score': metrics.get('spec'),
                 'charge':       metrics.get('charge'),
@@ -197,6 +218,7 @@ class OptimizationWorker(Thread):
         import pandas as pd
         start = time.time()
         while time.time() - start < timeout:
+
             mode = self.gui.get_mode()  # "E-Spec" or "Profile & ICT"
             overall = None  # will be set below
 
@@ -206,8 +228,10 @@ class OptimizationWorker(Thread):
             charge_std = None
 
             N = self.gui.shots_spin.value()
+            print(f"Collecting metrics for mode '{mode}' with N={N}...")
 
             if mode == 'E-Spec':
+                print("Using E-Spec mode")
                 path = self.gui.espec_dir
                 # Gather latest N output files (.txt and .csv)
                 txt_files = sorted(glob.glob(os.path.join(path, '*.txt')))
@@ -301,12 +325,19 @@ class OptimizationWorker(Thread):
                 else:
                     overall = 0.0
                 # Return mean and std for plotting error bars
-                return {'overall': overall, 'spec': spec, 'charge': charge, 'spec_std': spec_std, 'charge_std': charge_std, 'stability': stability}
-
+                result = {'overall': overall, 'spec': spec, 'charge': charge, 'spec_std': spec_std, 'charge_std': charge_std, 'stability': stability}
+                print("Returning metrics dict:", result)  # Debug print
+                # If result is accidentally a Series, convert to dict
+                if hasattr(result, "to_dict") and not isinstance(result, dict):
+                    print("Converting result to dict")
+                    result = result.to_dict()
+                return result
+            
             time.sleep(0.1)
 
         # Timeout: no full data set available
-        return
+        print("Returning None from collect_metrics")
+        return None
 
 class LPAControlGUI(QMainWindow):
     def __init__(self):
