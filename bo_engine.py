@@ -87,8 +87,10 @@ def create_xopt(active_params, evaluator, bounds, resume_file=None, acquisition_
             Scalarizes multi-objective results into a single 'overall' score using the geometric mean.
             Returns a list of dicts with the 'overall' key for each parameter set.
             """
-            mos = evaluator(param_list)
+            mos = evaluator(param_list) # Call the user-supplied evaluator and get multi-objective results
             out = []
+            # Iterate over the multi-objective results
+            # and compute the geometric mean for 'overall' score !!!Can be changed!!!
             for m in mos:
                 sc, ch, st = m.get('spectra_score'), m.get('charge'), m.get('stability')
                 if None in (sc, ch, st):
@@ -125,13 +127,25 @@ def create_xopt(active_params, evaluator, bounds, resume_file=None, acquisition_
     def wrapped_evaluator(param_list):
         """
         Checks the output of the user-supplied evaluator for missing required keys.
-        Raises ValueError if any of 'spectra_score', 'charge', or 'stability' are missing.
-        Also checks that the output is a list of dicts.
-        Returns the original results if valid.
+        Handles both single dict and list-of-dicts input for Xopt compatibility.
+        Returns a single dict if input is a dict, or a list of dicts if input is a list.
         """
+        # If param_list is a dict, treat as single evaluation
+        if isinstance(param_list, dict):
+            results = evaluator([param_list])
+            if not isinstance(results, list) or len(results) != 1:
+                raise TypeError("Evaluator must return a list of one dict for single input.")
+            res = results[0]
+            if not isinstance(res, dict):
+                raise TypeError("Evaluator result is not a dict.")
+            for key in ("spectra_score", "charge", "stability"):
+                if key not in res:
+                    raise ValueError(f"Evaluator result missing required key '{key}'.")
+            return res
+        # If param_list is a list, treat as batch evaluation
         results = evaluator(param_list)
         if not isinstance(results, list):
-            raise TypeError("Evaluator must return a list of dicts.")
+            raise TypeError("Evaluator must return a list of dicts for batch input.")
         for i, res in enumerate(results):
             if not isinstance(res, dict):
                 raise TypeError(f"Evaluator result at index {i} is not a dict.")
@@ -147,4 +161,5 @@ def create_xopt(active_params, evaluator, bounds, resume_file=None, acquisition_
     if resume_file:
         return Xopt.from_file(resume_file)
     else:
-        return Xopt(vocs=vocs, evaluator=wrapped_evaluator, generator=gen)
+        # Xopt expects evaluator as a dict: {'function': <callable>}
+        return Xopt(vocs=vocs, evaluator={'function': wrapped_evaluator}, generator=gen)

@@ -35,7 +35,7 @@ from PyQt5.QtWidgets import (
     QSlider,            # Slider widget for manual control
     QGridLayout,        # Grid layout manager for complex arrangements
 )
-from PyQt5.QtCore import Qt, pyqtSignal, QObject, QSettings  # Added QSettings
+from PyQt5.QtCore import Qt, pyqtSignal, QObject, QSettings, QThread # Added QSettings
 import pyqtgraph as pg  # High-performance plotting library for PyQt
 from PyQt5.QtGui import QFont
 from PyQt5.QtGui import QFontDatabase  # Font database for custom fonts
@@ -58,7 +58,7 @@ class WorkerSignals(QObject):
     param_request   = pyqtSignal(dict)   # request GUI to confirm
     param_confirmed = pyqtSignal(dict)
 
-class OptimizationWorker(Thread):
+class OptimizationWorker(QThread):
     """
     Runs in the background to:
      1. Propose new control-knob settings using Xopt
@@ -95,12 +95,19 @@ class OptimizationWorker(Thread):
     def run(self):
         shot = 0
 
+        # Ensure initial data is available for Xopt
+        if getattr(self.X, "data", None) is None or len(self.X.data) == 0:
+            self.X.random_evaluate()
+
         # Main loop: keep going until user stops
         while not self.stop_event.is_set():
             shot += 1
 
             # Generate new suggestions using Bayesian optimization
             step = self.X.step()
+            if step is None or not hasattr(step, 'data') or step.data is None:
+                print("[OptimizationWorker] Xopt.step() returned None or invalid step. Stopping optimization.")
+                break
             suggestions = dict(step.data.iloc[-1])
 
             # Tell GUI: here are the next settings to try
@@ -162,23 +169,78 @@ class OptimizationWorker(Thread):
         and returns a list of dicts with multi-objective metrics.
         """
         results = []
-        for params in inputs_list:
+        print(f"[evaluate] Received inputs_list of type {type(inputs_list)}")
+        # If inputs_list is a dict, convert to list of dicts
+        if isinstance(inputs_list, dict):
+            print(f"[evaluate] inputs_list is a dict with keys: {list(inputs_list.keys())}")
+            # Try to interpret as a single parameter set
+            # If all values are scalars, treat as one param set
+            if all(isinstance(v, (int, float, str)) for v in inputs_list.values()):
+                inputs_list = [inputs_list]
+                print(f"[evaluate] Converted dict to single-item list: {inputs_list}")
+            else:
+                # If values are lists, try to build param dicts for each
+                try:
+                    param_names = list(inputs_list.keys())
+                    param_values = list(inputs_list.values())
+                    n_items = len(param_values[0])
+                    inputs_list = [dict(zip(param_names, [pv[i] for pv in param_values])) for i in range(n_items)]
+                    print(f"[evaluate] Converted dict of lists to list of dicts: {inputs_list}")
+                except Exception as e:
+                    print(f"[evaluate] Could not convert dict to list of dicts: {e}")
+                    inputs_list = []
+
+        print(f"[evaluate] Final inputs_list type: {type(inputs_list)}, length: {len(inputs_list) if hasattr(inputs_list, 'len') else 'N/A'}")
+        for idx, params in enumerate(inputs_list):
+            print(f"[evaluate] Processing input {idx}: type={type(params)}, value={params}")
+            if not isinstance(params, dict):
+                import ast # Safely convert string to dict
+                try:
+                    params = ast.literal_eval(params)
+                    print(f"[evaluate] Converted parameters to dict: {params}")
+                except Exception as e:
+                    print(f"[evaluate] Failed to convert parameters: {params}, error: {e}")
+                    continue  # skip if cannot convert
+
             self.param_event.clear()
             self.signals.param_request.emit(params)
+            print(f"[evaluate] Waiting for user to confirm parameters: {params}")
             while not self.param_event.is_set() and not self.stop_event.is_set():
                 time.sleep(0.05)
             if self.stop_event.is_set():
+                print("[evaluate] Stop event set, breaking loop.")
                 break
             try:
                 metrics = self.collect_metrics(timeout=5)
-            except Exception:
+            except Exception as e:
+                print(f"[evaluate] Exception in collect_metrics: {e}")
                 metrics = {'spec': None, 'charge': None, 'stability': None}
-            # Map collected metrics to Xopt objectives
-            results.append({
+            print(f"[evaluate] metrics after collect_metrics: type={type(metrics)}, value={metrics}")
+            # Convert pandas Series or DataFrame to dict if needed
+            if metrics is None:
+                print(f"[evaluate] Metrics is None, skipping.")
+                continue
+            if isinstance(metrics, (list, tuple)):
+                print(f"[evaluate] Metrics is a list/tuple, skipping: {metrics}")
+                continue
+            if hasattr(metrics, "to_dict") and not isinstance(metrics, dict):
+                print(f"[evaluate] Metrics has to_dict, converting.")
+                metrics = metrics.to_dict()
+            if not isinstance(metrics, dict):
+                print(f"[evaluate] Warning: metrics is not a dict after conversion, skipping. Type: {type(metrics)} Value: {metrics}")
+                continue
+            # Final check for required keys
+            for key in ('spec', 'charge', 'stability'):
+                if key not in metrics:
+                    print(f"[evaluate] Warning: metrics missing key '{key}', value: {metrics}")
+            result_dict = {
                 'spectra_score': metrics.get('spec'),
                 'charge':       metrics.get('charge'),
                 'stability':    metrics.get('stability')
-            })
+            }
+            print(f"[evaluate] Appending result dict: {result_dict}")
+            results.append(result_dict)
+        print(f"[evaluate] Returning results list of length {len(results)}: {results}")
         return results
 
     def on_param_confirmed(self, params):
@@ -197,6 +259,7 @@ class OptimizationWorker(Thread):
         import pandas as pd
         start = time.time()
         while time.time() - start < timeout:
+
             mode = self.gui.get_mode()  # "E-Spec" or "Profile & ICT"
             overall = None  # will be set below
 
@@ -206,8 +269,10 @@ class OptimizationWorker(Thread):
             charge_std = None
 
             N = self.gui.shots_spin.value()
+            print(f"Collecting metrics for mode '{mode}' with N={N}...")
 
             if mode == 'E-Spec':
+                print("Using E-Spec mode")
                 path = self.gui.espec_dir
                 # Gather latest N output files (.txt and .csv)
                 txt_files = sorted(glob.glob(os.path.join(path, '*.txt')))
@@ -301,12 +366,19 @@ class OptimizationWorker(Thread):
                 else:
                     overall = 0.0
                 # Return mean and std for plotting error bars
-                return {'overall': overall, 'spec': spec, 'charge': charge, 'spec_std': spec_std, 'charge_std': charge_std, 'stability': stability}
-
+                result = {'overall': overall, 'spec': spec, 'charge': charge, 'spec_std': spec_std, 'charge_std': charge_std, 'stability': stability}
+                print("Returning metrics dict:", result)  # Debug print
+                # If result is accidentally a Series, convert to dict
+                if hasattr(result, "to_dict") and not isinstance(result, dict):
+                    print("Converting result to dict")
+                    result = result.to_dict()
+                return result
+            
             time.sleep(0.1)
 
         # Timeout: no full data set available
-        return
+        print("Returning None from collect_metrics")
+        return None
 
 class LPAControlGUI(QMainWindow):
     def __init__(self):
@@ -549,12 +621,13 @@ class LPAControlGUI(QMainWindow):
         self.activity_log.append(f"[{ts}] {message}")
 
     def copy_suggestions_to_use(self):
-        """Copy the suggested values into the 'Use' input boxes and reset highlight."""
+        """Copy the suggested values into the 'Use' input boxes and reset highlight, only for checked parameters."""
         for name, (sug, use) in self.param_widgets.items():
-            use.setText(sug.text())
-            use.setStyleSheet("background: white;")  # Reset background
+            if self.param_checks[name].isChecked():
+                use.setText(sug.text())
+                use.setStyleSheet("background: white;")  # Reset background
         self._use_fields_edited = set()  # Track which fields have been edited
-        self.log_activity("Copied suggested parameters to 'Use' boxes.")
+        self.log_activity("Copied suggested parameters to 'Use' boxes for active parameters.")
 
     def _on_use_field_edited(self, name, widget):
         """Highlight the 'Use' field if edited after copying suggestions."""
@@ -700,6 +773,9 @@ class LPAControlGUI(QMainWindow):
         """
         self.confirmed_params = None
         for name, val in sugg.items():
+            # Only round numeric values
+            if isinstance(val, (int, float)):
+                val = round(val, 1)
             if name in self.param_widgets:
                 self.param_widgets[name][0].setText(str(val))
         self.confirm_btn.setEnabled(True)
