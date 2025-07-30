@@ -45,8 +45,24 @@ def create_xopt(active_params, evaluator, bounds, resume_file=None, acquisition_
     print(f"Creating Xopt with {len(active_params)} active parameters: {active_params}")
 
     # 2) Build VOCS
+    # If bounds[p] has three elements [lo, hi, step], generate a discrete grid.
+    vocs_vars = {}
+    for p in active_params:
+        b = bounds[p]
+        # discrete grid: [min, max, step]
+        if isinstance(b, (list, tuple)) and len(b) == 3:
+            lo, hi, step = b
+            # number of points (inclusive)
+            n = int(round((hi - lo) / step)) + 1
+            # build grid, rounding to avoid floating errors
+            grid = [round(lo + i*step, 10) for i in range(n)]
+            vocs_vars[p] = grid
+        else:
+            # continuous [min, max]
+            vocs_vars[p] = b
+
     vocs = VOCS(
-        variables={p: bounds[p] for p in active_params},
+        variables=vocs_vars,
         objectives={
             "spectra_score": "MAXIMIZE",
             "charge":         "MAXIMIZE",

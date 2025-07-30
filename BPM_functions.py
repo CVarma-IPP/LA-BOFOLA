@@ -10,7 +10,7 @@ from numpy import trapz
 from scipy.optimize import curve_fit
 from scipy.interpolate import interp1d
 from scipy.signal import find_peaks
-from tifffile import imsave
+# from tifffile import imsave
 import threading
 import imageio
 import easygui

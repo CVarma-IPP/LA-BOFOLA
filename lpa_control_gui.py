@@ -85,6 +85,10 @@ class OptimizationWorker(QThread):
         # Initialize Xopt optimizer with active knobs and evaluation function
         mode   = self.gui.get_acquisition_mode()
         bounds = self.gui.get_bounds()
+        # Add min step size for bounds by adding a third member [lower, upper, step size (default 0.5)]
+        for p, (lo, hi) in bounds.items():
+            if isinstance(lo, (int, float)) and isinstance(hi, (int, float)):
+                bounds[p] = [lo, hi, 0.5]
         self.X  = create_xopt(
             self.gui.get_active_params(),
             self.evaluate,
@@ -110,6 +114,11 @@ class OptimizationWorker(QThread):
                 break
             suggestions = dict(step.data.iloc[-1])
 
+            # Round suggestions to nearest integer + 1 decimal place
+            for key, value in suggestions.items():
+                if isinstance(value, (int, float)):
+                    suggestions[key] = round(value, 1)
+        
             # Tell GUI: here are the next settings to try
             self.signals.new_suggestions.emit(suggestions)
 
@@ -122,6 +131,11 @@ class OptimizationWorker(QThread):
             if self.stop_event.is_set():
                 break
             params = self.confirmed_params.copy() if self.confirmed_params else suggestions.copy()
+
+            # --- ROUND PARAMS BEFORE ADDING TO Xopt HISTORY ---
+            for k, v in params.items():
+                if isinstance(v, float):
+                    params[k] = round(v, 1)
 
             # TODO: actually push these settings to your hardware
 
@@ -193,6 +207,7 @@ class OptimizationWorker(QThread):
         print(f"[evaluate] Final inputs_list type: {type(inputs_list)}, length: {len(inputs_list) if hasattr(inputs_list, 'len') else 'N/A'}")
         for idx, params in enumerate(inputs_list):
             print(f"[evaluate] Processing input {idx}: type={type(params)}, value={params}")
+
             if not isinstance(params, dict):
                 import ast # Safely convert string to dict
                 try:
@@ -201,9 +216,13 @@ class OptimizationWorker(QThread):
                 except Exception as e:
                     print(f"[evaluate] Failed to convert parameters: {params}, error: {e}")
                     continue  # skip if cannot convert
+            
+            # --- ROUND PARAMS TO 1 DECIMAL PLACE ---
+            params = {k: round(v, 1) if isinstance(v, float) else v for k, v in params.items()}
 
             self.param_event.clear()
             self.signals.param_request.emit(params)
+
             print(f"[evaluate] Waiting for user to confirm parameters: {params}")
             while not self.param_event.is_set() and not self.stop_event.is_set():
                 time.sleep(0.05)
@@ -215,6 +234,7 @@ class OptimizationWorker(QThread):
             except Exception as e:
                 print(f"[evaluate] Exception in collect_metrics: {e}")
                 metrics = {'spec': None, 'charge': None, 'stability': None}
+
             print(f"[evaluate] metrics after collect_metrics: type={type(metrics)}, value={metrics}")
             # Convert pandas Series or DataFrame to dict if needed
             if metrics is None:
@@ -250,13 +270,13 @@ class OptimizationWorker(QThread):
     def collect_metrics(self, timeout=5):
         """
         Look in the measurement folders for your latest E-Spec or Profile & ICT data.
-        - In E-Spec mode: read score,cost,counts from espectra .txt files or score/charge from CSV files.
+        - In E-Spec mode: read score and raw from summary lines in .csv files, or score,cost,counts from .txt files.
         - In Profile & ICT mode: fallback to spec from profile_dir and charge from ict_dir.
         Returns a dict when both spec & charge are ready, or None after timeout.
         Computes mean and std over last N shots for the current parameter set.
         """
         import numpy as np
-        import pandas as pd
+        import time
         start = time.time()
         while time.time() - start < timeout:
 
@@ -280,6 +300,15 @@ class OptimizationWorker(QThread):
                 # Use only the latest N files (prefer txt, then csv)
                 all_files = txt_files + csv_files
                 all_files = sorted(all_files)[-N:]
+                if len(all_files)< N:
+                    # Log only once per wait
+                    if not hasattr(self, '_waiting_for_files') or not self._waiting_for_files:
+                        self.gui.log_activity(f"Waiting for at least {N} files in {path} (found {len(all_files)}).")
+                        self._waiting_for_files = True
+                    time.sleep(0.2)
+                    continue
+                else:
+                    self._waiting_for_files = False
                 # Print notification if new files are detected
                 if hasattr(self, '_last_seen_files'):
                     new_files = set(all_files) - set(self._last_seen_files)
@@ -299,21 +328,33 @@ class OptimizationWorker(QThread):
                             scores.append(sc)
                             charges.append(ct)
                         elif fn.endswith('.csv'):
-                            df = pd.read_csv(fn)
-                            # Try to find columns for score and charge
-                            score_col = None
-                            charge_col = None
-                            for col in df.columns:
-                                if 'score' in col.lower():
-                                    score_col = col
-                                if 'charge' in col.lower() or 'counts' in col.lower():
-                                    charge_col = col
-                            if score_col is None or charge_col is None:
-                                score_col = df.columns[0]
-                                charge_col = df.columns[1]
-                            # Use last row in CSV as the latest shot
-                            scores.append(df[score_col].values[-1])
-                            charges.append(df[charge_col].values[-1])
+                            score_val = None
+                            charge_val = None
+                            with open(fn, 'r') as f:
+                                for line in f:
+                                    line = line.strip()
+                                    if not line or line.startswith('#'):
+                                        continue
+                                    parts = line.split(',')
+                                    if len(parts) != 2:
+                                        continue
+                                    key, value = parts[0].strip().lower(), parts[1].strip()
+                                    if key == 'score' and score_val is None:
+                                        try:
+                                            score_val = float(value)
+                                        except Exception:
+                                            pass
+                                    elif key == 'raw' and charge_val is None:
+                                        try:
+                                            charge_val = float(value)
+                                        except Exception:
+                                            pass
+                                    if score_val is not None and charge_val is not None:
+                                        break
+                            if score_val is not None:
+                                scores.append(score_val)
+                            if charge_val is not None:
+                                charges.append(charge_val)
                     except Exception as e:
                         print(f"Error parsing E-Spec file {fn}: {e}")
                 if scores and charges:
