@@ -44,9 +44,23 @@ def create_xopt(active_params, evaluator, bounds, resume_file=None, acquisition_
 
     print(f"Creating Xopt with {len(active_params)} active parameters: {active_params}")
 
-    # 2) Build VOCS
+    # 2) Build VOCS and grid for snapping
+    vocs_vars = {}
+    param_grids = {}
+    for p in active_params:
+        b = bounds[p]
+        if isinstance(b, (list, tuple)) and len(b) == 3:
+            lo, hi, step = b
+            vocs_vars[p] = [lo, hi]  # Always use continuous for VOCS
+            # Build grid for snapping (exclude edges)
+            n = int(round((hi - lo) / step)) - 1
+            grid = [lo + (i + 1) * step for i in range(n)]
+            param_grids[p] = grid
+        else:
+            vocs_vars[p] = b
+
     vocs = VOCS(
-        variables={p: bounds[p] for p in active_params},
+        variables={p: vocs_vars[p] for p in active_params},
         objectives={
             "spectra_score": "MAXIMIZE",
             "charge":         "MAXIMIZE",
@@ -55,6 +69,30 @@ def create_xopt(active_params, evaluator, bounds, resume_file=None, acquisition_
     )
 
     print(f"VOCS created with variables: {vocs.variables}")
+
+    def snap_to_grid(params, param_grids):
+        """
+        Snaps each parameter in params to the nearest value in its defined grid.
+        If no grid is defined for a parameter, it returns the original value.
+
+        Parameters:
+        ----------
+        - params: dict of parameter values to snap
+        - param_grids: dict of parameter grids for snapping
+
+        Returns:
+        -------
+        - dict of snapped parameter values
+        """
+        snapped = {}
+        for k, v in params.items():
+            if k in param_grids and param_grids[k]:
+                grid = param_grids[k]
+                # Find nearest grid value
+                snapped[k] = min(grid, key=lambda x: abs(x - v))
+            else:
+                snapped[k] = v
+        return snapped
 
     # 3) Choose generator based on acquisition_mode
     """
@@ -127,12 +165,14 @@ def create_xopt(active_params, evaluator, bounds, resume_file=None, acquisition_
     def wrapped_evaluator(param_list):
         """
         Checks the output of the user-supplied evaluator for missing required keys.
+        Snaps each parameter to the nearest grid value (if grid is defined for that parameter).
         Handles both single dict and list-of-dicts input for Xopt compatibility.
         Returns a single dict if input is a dict, or a list of dicts if input is a list.
         """
         # If param_list is a dict, treat as single evaluation
         if isinstance(param_list, dict):
-            results = evaluator([param_list])
+            snapped = snap_to_grid(param_list, param_grids)
+            results = evaluator([snapped])
             if not isinstance(results, list) or len(results) != 1:
                 raise TypeError("Evaluator must return a list of one dict for single input.")
             res = results[0]
@@ -143,7 +183,8 @@ def create_xopt(active_params, evaluator, bounds, resume_file=None, acquisition_
                     raise ValueError(f"Evaluator result missing required key '{key}'.")
             return res
         # If param_list is a list, treat as batch evaluation
-        results = evaluator(param_list)
+        snapped_list = [snap_to_grid(p, param_grids) for p in param_list]
+        results = evaluator(snapped_list)
         if not isinstance(results, list):
             raise TypeError("Evaluator must return a list of dicts for batch input.")
         for i, res in enumerate(results):

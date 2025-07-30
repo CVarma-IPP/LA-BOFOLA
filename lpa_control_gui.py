@@ -40,6 +40,7 @@ import pyqtgraph as pg  # High-performance plotting library for PyQt
 from PyQt5.QtGui import QFont
 from PyQt5.QtGui import QFontDatabase  # Font database for custom fonts
 
+import ast
 # Configure pyqtgraph aesthetics
 pg.setConfigOption('background', '#f0f8ff')  # Set plot background to AliceBlue
 pg.setConfigOption('foreground', '#006064')  # Set plot axes/text to Dark Cyan
@@ -85,6 +86,12 @@ class OptimizationWorker(QThread):
         # Initialize Xopt optimizer with active knobs and evaluation function
         mode   = self.gui.get_acquisition_mode()
         bounds = self.gui.get_bounds()
+        # Only use [low, high] for each parameter; grid snapping is handled in bo_engine
+        for p, (low, high) in bounds.items():
+            if isinstance(low, (int, float)) and isinstance(high, (int, float)):
+                bounds[p] = [low, high]
+        # Create the Xopt optimizer instance
+        print(f"[OptimizationWorker] Initializing Xopt with bounds: {bounds}")
         self.X  = create_xopt(
             self.gui.get_active_params(),
             self.evaluate,
@@ -102,6 +109,8 @@ class OptimizationWorker(QThread):
         # Main loop: keep going until user stops
         while not self.stop_event.is_set():
             shot += 1
+
+            print(f"[OptimizationWorker] Starting shot {shot}...")
 
             # Generate new suggestions using Bayesian optimization
             step = self.X.step()
@@ -137,10 +146,13 @@ class OptimizationWorker(QThread):
 
             # Read back the last few shots’ data (up to a timeout)
             try:
-                metrics = self.collect_metrics(timeout=5)
+                metrics = self.collect_metrics(timeout=50)
             except Exception as e:
                 metrics = {'overall': None, 'spec': None, 'charge': None}
             if metrics is None:
+                print("[OptimizationWorker] Waiting for new data files to appear in the output directory...")
+                if hasattr(self.gui, 'log_activity'):
+                    self.gui.log_activity("Waiting for new data files to appear in the output directory...")
                 metrics = {'overall': None, 'spec': None, 'charge': None}
 
             # Build multi-objective result for Xopt
@@ -205,14 +217,16 @@ class OptimizationWorker(QThread):
             print(f"[evaluate] Processing input {idx}: type={type(params)}, value={params}")
 
             if not isinstance(params, dict):
-                import ast # Safely convert string to dict
+                # Safely convert string to dict
                 try:
                     params = ast.literal_eval(params)
                     print(f"[evaluate] Converted parameters to dict: {params}")
                 except Exception as e:
                     print(f"[evaluate] Failed to convert parameters: {params}, error: {e}")
-                    continue  # skip if cannot convert
-            
+                    # If cannot convert, append a dict of None values
+                    results.append({'spectra_score': None, 'charge': None, 'stability': None})
+                    continue
+
             # --- ROUND PARAMS TO 1 DECIMAL PLACE ---
             params = {k: round(v, 1) if isinstance(v, float) else v for k, v in params.items()}
 
@@ -226,7 +240,7 @@ class OptimizationWorker(QThread):
                 print("[evaluate] Stop event set, breaking loop.")
                 break
             try:
-                metrics = self.collect_metrics(timeout=5)
+                metrics = self.collect_metrics(timeout=50)
             except Exception as e:
                 print(f"[evaluate] Exception in collect_metrics: {e}")
                 metrics = {'spec': None, 'charge': None, 'stability': None}
@@ -234,16 +248,19 @@ class OptimizationWorker(QThread):
             print(f"[evaluate] metrics after collect_metrics: type={type(metrics)}, value={metrics}")
             # Convert pandas Series or DataFrame to dict if needed
             if metrics is None:
-                print(f"[evaluate] Metrics is None, skipping.")
+                print(f"[evaluate] Metrics is None, returning all-None dict for this input.")
+                results.append({'spectra_score': None, 'charge': None, 'stability': None})
                 continue
             if isinstance(metrics, (list, tuple)):
                 print(f"[evaluate] Metrics is a list/tuple, skipping: {metrics}")
+                results.append({'spectra_score': None, 'charge': None, 'stability': None})
                 continue
             if hasattr(metrics, "to_dict") and not isinstance(metrics, dict):
                 print(f"[evaluate] Metrics has to_dict, converting.")
                 metrics = metrics.to_dict()
             if not isinstance(metrics, dict):
-                print(f"[evaluate] Warning: metrics is not a dict after conversion, skipping. Type: {type(metrics)} Value: {metrics}")
+                print(f"[evaluate] Warning: metrics is not a dict after conversion, returning all-None dict. Type: {type(metrics)} Value: {metrics}")
+                results.append({'spectra_score': None, 'charge': None, 'stability': None})
                 continue
             # Final check for required keys
             for key in ('spec', 'charge', 'stability'):
@@ -263,7 +280,7 @@ class OptimizationWorker(QThread):
         self.confirmed_params = params
         self.param_event.set()
 
-    def collect_metrics(self, timeout=5):
+    def collect_metrics(self, timeout=500):
         """
         Look in the measurement folders for your latest E-Spec or Profile & ICT data.
         - In E-Spec mode: read score and raw from summary lines in .csv files, or score,cost,counts from .txt files.
