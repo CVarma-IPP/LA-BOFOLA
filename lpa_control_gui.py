@@ -146,7 +146,7 @@ class OptimizationWorker(QThread):
 
             # Read back the last few shots’ data (up to a timeout)
             try:
-                metrics = self.collect_metrics(timeout=50)
+                metrics = self.collect_metrics(timeout=300)
             except Exception as e:
                 metrics = {'overall': None, 'spec': None, 'charge': None}
             if metrics is None:
@@ -240,7 +240,7 @@ class OptimizationWorker(QThread):
                 print("[evaluate] Stop event set, breaking loop.")
                 break
             try:
-                metrics = self.collect_metrics(timeout=50)
+                metrics = self.collect_metrics(timeout=300)
             except Exception as e:
                 print(f"[evaluate] Exception in collect_metrics: {e}")
                 metrics = {'spec': None, 'charge': None, 'stability': None}
@@ -287,11 +287,19 @@ class OptimizationWorker(QThread):
         - In Profile & ICT mode: fallback to spec from profile_dir and charge from ict_dir.
         Returns a dict when both spec & charge are ready, or None after timeout.
         Computes mean and std over last N shots for the current parameter set.
+        Implements a sliding timeout: the timer resets every time new files are detected.
         """
         import numpy as np
         import time
+        last_new_file_time = time.time()
+        last_seen_files = set()
         start = time.time()
-        while time.time() - start < timeout:
+        while True:
+            now = time.time()
+            # Sliding timeout: break if no new files for 'timeout' seconds
+            if now - last_new_file_time > timeout:
+                print("Sliding timeout expired: no new files detected for", timeout, "seconds.")
+                break
 
             mode = self.gui.get_mode()  # "E-Spec" or "Profile & ICT"
             overall = None  # will be set below
@@ -313,7 +321,18 @@ class OptimizationWorker(QThread):
                 # Use only the latest N files (prefer txt, then csv)
                 all_files = txt_files + csv_files
                 all_files = sorted(all_files)[-N:]
-                if len(all_files)< N:
+                all_files_set = set(all_files)
+                # Detect new files
+                if all_files_set != last_seen_files:
+                    new_files = all_files_set - last_seen_files
+                    if new_files:
+                        last_new_file_time = now  # Reset sliding timeout
+                        for fn in new_files:
+                            parts = os.path.normpath(fn).split(os.sep)
+                            subpath = os.sep.join(parts[-4:]) if len(parts) >= 4 else fn
+                            print(f"[File Detected] New E-Spec file: .../{subpath}")
+                    last_seen_files = all_files_set.copy()
+                if len(all_files) < N:
                     # Log only once per wait
                     if not hasattr(self, '_waiting_for_files') or not self._waiting_for_files:
                         self.gui.log_activity(f"Waiting for at least {N} files in {path} (found {len(all_files)}).")
@@ -322,16 +341,6 @@ class OptimizationWorker(QThread):
                     continue
                 else:
                     self._waiting_for_files = False
-                # Print notification if new files are detected
-                if hasattr(self, '_last_seen_files'):
-                    new_files = set(all_files) - set(self._last_seen_files)
-                    if new_files:
-                        for fn in new_files:
-                            # Print last 3 subfolder addresses
-                            parts = os.path.normpath(fn).split(os.sep)
-                            subpath = os.sep.join(parts[-4:]) if len(parts) >= 4 else fn
-                            print(f"[File Detected] New E-Spec file: .../{subpath}")
-                self._last_seen_files = list(all_files)
                 scores, charges = [], []
                 for fn in all_files:
                     try:
@@ -377,9 +386,18 @@ class OptimizationWorker(QThread):
                     charge_std = float(np.std(charges))
             else:
                 # ----- Profile & ICT branch (unchanged) -----
-                # spec from profile_dir
                 prof = self.gui.profile_dir
                 prof_files = sorted(glob.glob(os.path.join(prof, '*.txt')))
+                prof_files_set = set(prof_files)
+                if prof_files_set != last_seen_files:
+                    new_files = prof_files_set - last_seen_files
+                    if new_files:
+                        last_new_file_time = now
+                        for fn in new_files:
+                            parts = os.path.normpath(fn).split(os.sep)
+                            subpath = os.sep.join(parts[-4:]) if len(parts) >= 4 else fn
+                            print(f"[File Detected] New Profile file: .../{subpath}")
+                    last_seen_files = prof_files_set.copy()
                 if len(prof_files) >= N:
                     try:
                         vals = [float(open(f).readline()) for f in prof_files[-N:]]
@@ -388,9 +406,18 @@ class OptimizationWorker(QThread):
                     except Exception as e:
                         print(f"Error reading profile spec files: {e}")
 
-                # charge from ict_dir
                 ict = self.gui.ict_dir
                 ict_files = sorted(glob.glob(os.path.join(ict, '*.txt')))
+                ict_files_set = set(ict_files)
+                if ict_files_set != last_seen_files:
+                    new_files = ict_files_set - last_seen_files
+                    if new_files:
+                        last_new_file_time = now
+                        for fn in new_files:
+                            parts = os.path.normpath(fn).split(os.sep)
+                            subpath = os.sep.join(parts[-4:]) if len(parts) >= 4 else fn
+                            print(f"[File Detected] New ICT file: .../{subpath}")
+                    last_seen_files = ict_files_set.copy()
                 if len(ict_files) >= N:
                     try:
                         vals = [float(open(f).readline()) for f in ict_files[-N:]]
@@ -422,12 +449,11 @@ class OptimizationWorker(QThread):
                 # Return mean and std for plotting error bars
                 result = {'overall': overall, 'spec': spec, 'charge': charge, 'spec_std': spec_std, 'charge_std': charge_std, 'stability': stability}
                 print("Returning metrics dict:", result)  # Debug print
-                # If result is accidentally a Series, convert to dict
                 if hasattr(result, "to_dict") and not isinstance(result, dict):
                     print("Converting result to dict")
                     result = result.to_dict()
                 return result
-            
+
             time.sleep(0.1)
 
         # Timeout: no full data set available
